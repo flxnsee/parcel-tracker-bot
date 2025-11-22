@@ -6,6 +6,8 @@ import html
 from pathlib import Path
 import requests
 from datetime import datetime, timedelta
+from flask import Flask
+import threading
 
 TRACKING_NUMBER = os.environ.get("TRACKING_NUMBER")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -183,5 +185,15 @@ def main():
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "Bot is running"
+
+def run_flask():
+    app.run(host = "0.0.0.0", port = int(os.environ.get("PORT", 5000)))
+
 if __name__ == "__main__":
+    threading.Thread(target = run_flask).start()
     main()
