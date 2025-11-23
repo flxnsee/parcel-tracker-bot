@@ -132,7 +132,10 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     origin_flag = get_flag_emoji(origin)
     dest_flag = get_flag_emoji(dest)
 
-    desc = meta.get("raw_last_event", {}).get("description")
+    # 🛠 Ось тут була помилка
+    last_event = meta.get("raw_last_event") or {}
+    # спочатку пробуємо description, якщо немає — eventDetail
+    desc = last_event.get("description") or last_event.get("eventDetail")
 
     header = "ПОЧАТОК МОНІТОРИНГУ" if initial else "ОНОВЛЕННЯ СТАТУСУ"
 
