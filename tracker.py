@@ -76,12 +76,8 @@ def extract_main_fields(api_response: dict) -> dict:
         accepted = root.get("accepted", {})
         items = accepted.get("content", root.get("content", []))
 
-        if not items:
-            return result
+        tracking = root
 
-        tracking = items[0]
-
-        # трек-номер (Track123 зазвичай використовує "trackNo")
         result["tracking_number"] = (
                 tracking.get("trackNo")
                 or tracking.get("trackingNumber")
@@ -89,13 +85,24 @@ def extract_main_fields(api_response: dict) -> dict:
         )
 
         result["origin"] = tracking.get("shipFrom") or "Unknown"
-
-        # Якщо з вебхука прийде shipTo / destination, можна взяти звідти
-        result["destination"] = tracking.get("shipTo") or "UA"
+        result["destination"] = (
+            tracking.get("shipTo")
+            or tracking.get("destinationCountry")
+            or "UA"
+        )
 
         logistics = tracking.get("localLogisticsInfo", {})
-        details = logistics.get("trackingDetails", [])
-        last_tracking_time = tracking.get("lastTrackingTime")
+        details = (
+            logistics.get("trackingDetails")
+            or tracking.get("trackingDetails")
+            or []
+        )
+
+        last_tracking_time = (
+            tracking.get("lastTrackingTime")
+            or tracking.get("nextUpdateTime")
+            or tracking.get("shipTime")
+        )
 
         if details:
             last_event = details[0]
@@ -108,13 +115,27 @@ def extract_main_fields(api_response: dict) -> dict:
             else:
                 result["time_str"] = last_event.get("eventTime", "невідомо")
 
-            raw_detail = last_event.get("eventDetail", "")
+            raw_detail = (
+                last_event.get("eventDetail")
+                or logistics.get("transitSubStatus")
+                or tracking.get("transitSubStatus")
+                or tracking.get("trackingStatus")
+            )
+
             if raw_detail:
-                # беремо першу фразу до коми як основний статус
                 result["status_text"] = raw_detail.split(",")[0]
         else:
             if last_tracking_time:
                 result["time_str"] = last_tracking_time
+
+            status = (
+                logistics.get("transitSubStatus")
+                or tracking.get("transitSubStatus")
+                or tracking.get("trackingStatus")
+            )
+
+            if status:
+                result["status_text"] = status.split(",")[0]
     except:
         pass
 
@@ -180,13 +201,6 @@ def home():
 def track123_webhook():
     payload = request.get_json(silent=True)
 
-    try:
-        print("=== TRACK123 WEBHOOK RAW PAYLOAD ===")
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        print("====================================")
-    except Exception as e:
-        print("Не вдалося вивести JSON:", e)
-
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid json"}), 400
 
@@ -201,7 +215,7 @@ def track123_webhook():
     if initial or current_status != last_status:
         msg = format_message(tracking_number, meta, initial=initial)
         send_telegram(msg)
-        save_last_status(last_status)
+        save_last_status(current_status)
 
     return jsonify({"ok": True}), 200
 
