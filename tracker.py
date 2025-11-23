@@ -180,6 +180,13 @@ def home():
 def track123_webhook():
     payload = request.get_json(silent=True)
 
+    try:
+        print("=== TRACK123 WEBHOOK RAW PAYLOAD ===")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print("====================================")
+    except Exception as e:
+        print("Не вдалося вивести JSON:", e)
+
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid json"}), 400
 
