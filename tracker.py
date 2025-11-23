@@ -6,17 +6,17 @@ import html
 from pathlib import Path
 import requests
 from datetime import datetime, timedelta
-from flask import Flask
+from flask import request, jsonify, Flask
 import threading
+
+app = Flask(__name__)
 
 TRACKING_NUMBER = os.environ.get("TRACKING_NUMBER")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 TRACK123_API_KEY = os.environ.get("TRACK123_API_KEY")
-TRACK123_QUERY_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/query"
 
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "600"))
 STATUS_FILE = Path("last_status.json")
 
 EMOJI_THEMES = [
@@ -48,14 +48,6 @@ def send_telegram(message: str) -> None:
     except:
         pass
 
-def get_track123_raw(tracking_number: str) -> dict:
-    headers = {"Track123-Api-Secret": TRACK123_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
-    payload = {"trackNos": [tracking_number]}
-    resp = requests.post(TRACK123_QUERY_URL, json=payload, headers=headers, timeout=15)
-    resp.raise_for_status()
-
-    return resp.json()
-
 def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
     try:
         dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
@@ -70,18 +62,37 @@ def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
         return dt_str
 
 def extract_main_fields(api_response: dict) -> dict:
-    result = {"status_text": "UNKNOWN_STATUS", "time_str": "невідомо", "origin": "Unknown", "destination": "Unknown", "raw_last_event": None}
+    result = {
+        "status_text": "UNKNOWN_STATUS",
+        "time_str": "невідомо",
+        "origin": "Unknown",
+        "destination": "Unknown",
+        "raw_last_event": None,
+        "tracking_number": TRACKING_NUMBER or "Unknown",
+    }
 
     try:
-        accepted = api_response.get("data", {}).get("accepted", {})
-        items = accepted.get("content", [])
+        root = api_response.get("data", api_response)
+        accepted = root.get("accepted", {})
+        items = accepted.get("content", root.get("content", []))
 
         if not items:
             return result
 
         tracking = items[0]
+
+        # трек-номер (Track123 зазвичай використовує "trackNo")
+        result["tracking_number"] = (
+                tracking.get("trackNo")
+                or tracking.get("trackingNumber")
+                or result["tracking_number"]
+        )
+
         result["origin"] = tracking.get("shipFrom") or "Unknown"
-        result["destination"] = "UA"
+
+        # Якщо з вебхука прийде shipTo / destination, можна взяти звідти
+        result["destination"] = tracking.get("shipTo") or "UA"
+
         logistics = tracking.get("localLogisticsInfo", {})
         details = logistics.get("trackingDetails", [])
         last_tracking_time = tracking.get("lastTrackingTime")
@@ -89,13 +100,17 @@ def extract_main_fields(api_response: dict) -> dict:
         if details:
             last_event = details[0]
             result["raw_last_event"] = last_event
+
             tz = last_event.get("timezone", "+08:00")
+
             if last_tracking_time:
                 result["time_str"] = convert_to_kyiv_time(last_tracking_time, tz)
             else:
                 result["time_str"] = last_event.get("eventTime", "невідомо")
+
             raw_detail = last_event.get("eventDetail", "")
             if raw_detail:
+                # беремо першу фразу до коми як основний статус
                 result["status_text"] = raw_detail.split(",")[0]
         else:
             if last_tracking_time:
@@ -105,26 +120,28 @@ def extract_main_fields(api_response: dict) -> dict:
 
     return result
 
-def get_current_status_and_meta() -> tuple[str, dict]:
-    raw = get_track123_raw(TRACKING_NUMBER)
-    info = extract_main_fields(raw)
-
-    return info["status_text"], info
-
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
+
     status_text = html.escape(meta.get("status_text", "UNKNOWN"))
     time_str = html.escape(meta.get("time_str", "—"))
+
     origin = meta.get("origin", "Unknown")
     dest = meta.get("destination", "Unknown")
+
     origin_flag = get_flag_emoji(origin)
     dest_flag = get_flag_emoji(dest)
+
     desc = meta.get("raw_last_event", {}).get("description")
+
     header = "ПОЧАТОК МОНІТОРИНГУ" if initial else "ОНОВЛЕННЯ СТАТУСУ"
+
     msg = [
         f"<b>{theme['header']} {header}</b>",
         "",
-        f"📦 <b>Посилка:</b> <a href='https://www.track123.com/en/nums={tracking_number}'><code>{tracking_number}</code></a>",
+        f"📦 <b>Посилка:</b> "
+        f"<a href='https://www.track123.com/en/nums={tracking_number}'>"
+        f"<code>{tracking_number}</code></a>",
         f"{theme['pin']} <b>Статус:</b> {status_text}",
         "",
         f"<b>{theme['route']} Маршрут:</b> {origin_flag} {origin} ➔ {dest_flag} {dest}",
@@ -152,48 +169,32 @@ def save_last_status(status: str) -> None:
     except:
         pass
 
-def main():
-    if not TRACKING_NUMBER or not TRACK123_API_KEY:
-        raise RuntimeError("TRACKING_NUMBER або TRACK123_API_KEY не заданий.")
-
-    print(f"🚀 Бот запущено для посилки: {TRACKING_NUMBER}")
-
-    last_status = load_last_status()
-
-    print("Останній збережений статус:", last_status)
-
-    if last_status is None:
-        current, meta = get_current_status_and_meta()
-        save_last_status(current)
-        send_telegram(format_message(TRACKING_NUMBER, meta, initial=True))
-        last_status = current
-
-    while True:
-        try:
-            current, meta = get_current_status_and_meta()
-
-            if current != last_status:
-                send_telegram(format_message(TRACKING_NUMBER, meta, initial=False))
-                save_last_status(current)
-                last_status = current
-
-                print("✅ Статус змінився!")
-            else:
-                print("ℹ️ Статус не змінився.")
-        except Exception as e:
-            print("❌ Помилка:", e)
-
-        time.sleep(CHECK_INTERVAL_SECONDS)
-
-app = Flask(__name__)
-
 @app.get("/")
 def home():
-    return "Bot is running"
+    return "Bot is running!"
 
-def run_flask():
-    app.run(host = "0.0.0.0", port = int(os.environ.get("PORT", 5000)))
+@app.post("/track123-webhook")
+def track123_webhook():
+    payload = request.get_json(silent=True)
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid json"}), 400
+
+    meta = extract_main_fields(payload)
+
+    current_status = meta.get("status_text", "Unknown status")
+    tracking_number = meta.get("tracking_number") or TRACKING_NUMBER or "Unknown"
+
+    last_status = load_last_status()
+    initial = last_status is None
+
+    if initial or current_status != last_status:
+        msg = format_message(tracking_number, meta, initial=initial)
+        send_telegram(msg)
+        save_last_status(last_status)
+
+    return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
-    threading.Thread(target = run_flask).start()
-    main()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
