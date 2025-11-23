@@ -11,6 +11,8 @@ import threading
 
 app = Flask(__name__)
 
+REFRESH_INTERVAL = 6 * 60 * 60
+
 TRACKING_NUMBER = os.environ.get("TRACKING_NUMBER")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -24,6 +26,22 @@ EMOJI_THEMES = [
     {"header": "🆙", "pin": "📌", "route": "🛳️", "time": "⏱️"},
     {"header": "📣", "pin": "🚩", "route": "🚚", "time": "🕰️"},
 ]
+
+def refresh_tracking_periodically():
+    try:
+        if TRACKING_NUMBER or TRACK123_API_KEY:
+            url = "https://api.track123.com/gateway/open-api/tk/v2.1/track/refresh"
+            headers = {
+                "Track123-Api-Secret": TRACK123_API_KEY,
+                "Content-Type": "application/json",
+            }
+            payload = {"trackNos": [TRACKING_NUMBER]}
+
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    except Exception as e:
+        print(e)
+
+    threading.Timer(REFRESH_INTERVAL, refresh_tracking_periodically).start()
 
 def get_flag_emoji(code: str) -> str:
     if not code or len(code) != 2:
@@ -220,5 +238,7 @@ def track123_webhook():
     return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
+    refresh_tracking_periodically()
+
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
