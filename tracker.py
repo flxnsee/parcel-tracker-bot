@@ -164,6 +164,39 @@ def telegram_webhook():
 
         return jsonify({"ok": True})
 
+    if text.startswith("/list"):
+        subs = list(subscriptions.find({"chat_id": chat_id}))
+
+        if not subs:
+            send_telegram(chat_id, "📭 Ви ще не відстежуєте жодної посилки.\n"
+                                   "Додайте посилку командою:\n<code>/track НОМЕР</code>")
+
+            return jsonify({"ok": True})
+
+        track_nos = sorted({s['track_no'] for s in subs})
+
+        track_cursor = trackings.find({"track_no": {"$in": track_nos}})
+        tracks_map = {t["track_no"]: t for t in track_cursor}
+
+        lines = ["📦 <b>Ваші посилки:</b>"]
+
+        for tn in track_nos:
+            tr = tracks_map.get(tn, {})
+            status = tr.get("last_status", "Статус ще невідомий")
+            last_update = tr.get("last_update")
+
+            if isinstance(last_update, datetime):
+                last_str = last_update.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                last_str = "Час невідомий"
+
+            lines.append(f"• <code>{tn}</code> — {html.escape(status)} "
+                         f"(<i>{last_str}</i>)")
+
+        send_telegram(chat_id, "\n".join(lines))
+
+        return jsonify({"ok": True})
+
     if text.startswith("/track"):
         parts = text.split(maxsplit = 1)
 
@@ -176,19 +209,40 @@ def telegram_webhook():
 
         users.update_one(
             {"chat_id": chat_id},
-            {"$set": {"track_no": track_no}},
+            {"$set": {
+                "chat_id": chat_id,
+                "username": message.get("from", {}.get("username")),
+                "first_name": message.get("from", {}).get("first_name"),
+                "updated_at": datetime.utcnow(),
+            }},
+            upsert = True
+        )
+
+        trackings.update_one(
+            {"track_no": track_no},
+            {"$setOnInsert": {
+                "track_no": track_no,
+                "created_at": datetime.utcnow(),
+            }},
             upsert = True
         )
 
         subscriptions.update_one(
             {"chat_id": chat_id, "track_no": track_no},
-            {"$set": {"chat_id": chat_id, "track_no": track_no}},
+            {"$set": {
+                "chat_id": chat_id,
+                "track_no": track_no,
+                "created_at": datetime.utcnow()
+            }},
             upsert = True
         )
 
-        send_telegram(chat_id, f"🟢 Я слідкую за треком <code>{track_no}</code>!")
+        send_telegram(chat_id, f"🟢 Я почав слідкувати за посилкою <code>{track_no}</code>.\n"
+            f"Подивитися всі свої посилки: <code>/list</code>")
 
         return jsonify({"ok": True})
+
+    return jsonify({"ok": True})
 
 @app.post("/track123-webhook")
 def track123_webhook():
