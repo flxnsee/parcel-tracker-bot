@@ -22,6 +22,8 @@ REFRESH_INTERVAL = 6 * 60 * 60
 
 TRACK123_REFRESH_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/refresh"
 TRACK123_QUERY_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/query"
+TRACK123_IMPORT_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/import"
+TRACK123_DELETE_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/delete"
 
 EMOJI_THEMES = [
     {"header": "🔔", "pin": "📍", "route": "✈️", "time": "🕒"},
@@ -32,23 +34,31 @@ EMOJI_THEMES = [
 def get_flag_emoji(code: str) -> str:
     if not code or len(code) != 2:
         return "🌍"
-
     try:
         return "".join(chr(127397 + ord(c)) for c in code.upper())
-    except:
+    except Exception:
         return "🌍"
+
 
 def send_telegram(chat_id: int, message: str):
     if not TELEGRAM_TOKEN:
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url ,data = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    })
+    try:
+        requests.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
 
 def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
     try:
@@ -58,10 +68,10 @@ def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
         offset = timedelta(hours=hours, minutes=minutes) * sign
         dt_utc = dt - offset
         dt_kyiv = dt_utc + timedelta(hours=2)
-
         return dt_kyiv.strftime("%Y-%m-%d %H:%M:%S")
-    except:
+    except Exception:
         return dt_str
+
 
 def extract_main_fields(api_response: dict) -> dict:
     root = api_response.get("data", api_response)
@@ -69,7 +79,6 @@ def extract_main_fields(api_response: dict) -> dict:
     if "accepted" in root:
         accepted = root.get("accepted") or {}
         items = accepted.get("content") or root.get("content") or []
-
         if items:
             tracking = items[0]
         else:
@@ -90,9 +99,9 @@ def extract_main_fields(api_response: dict) -> dict:
     details = logistics.get("trackingDetails") or tracking.get("trackingDetails") or []
 
     last_tracking_time = (
-            tracking.get("lastTrackingTime")
-            or tracking.get("nextUpdateTime")
-            or tracking.get("shipTime")
+        tracking.get("lastTrackingTime")
+        or tracking.get("nextUpdateTime")
+        or tracking.get("shipTime")
     )
 
     if details:
@@ -100,45 +109,118 @@ def extract_main_fields(api_response: dict) -> dict:
         result["raw_last_event"] = last_event
 
         tz = last_event.get("timezone", "+08:00")
-        time = last_event.get("eventTime") or last_tracking_time
-        if time:
-            result["time_str"] = convert_to_kyiv_time(time, tz)
+        time_val = last_event.get("eventTime") or last_tracking_time
+        if time_val:
+            result["time_str"] = convert_to_kyiv_time(time_val, tz)
 
         detail = (
-                last_event.get("eventDetail")
-                or logistics.get("transitSubStatus")
-                or tracking.get("transitSubStatus")
-                or tracking.get("trackingStatus")
+            last_event.get("eventDetail")
+            or logistics.get("transitSubStatus")
+            or tracking.get("transitSubStatus")
+            or tracking.get("trackingStatus")
         )
         if detail:
             result["status_text"] = str(detail).split(",")[0]
 
     return result
 
+
+def register_tracking(track_no: str) -> bool:
+    if not TRACK123_API_KEY:
+        return False
+
+    headers = {
+        "Track123-Api-Secret": TRACK123_API_KEY,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
+
+    payload = [
+        {
+            "trackNo": track_no,
+        }
+    ]
+
+    try:
+        resp = requests.post(
+            TRACK123_IMPORT_URL,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if not resp.ok:
+            print("import error:", resp.status_code, resp.text)
+            return False
+        return True
+    except Exception as e:
+        print("import exception:", e)
+        return False
+
+
+def delete_tracking(track_no: str) -> bool:
+    if not TRACK123_API_KEY:
+        return False
+
+    headers = {
+        "Track123-Api-Secret": TRACK123_API_KEY,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
+
+    payload = {"trackNos": [track_no]}
+
+    try:
+        resp = requests.post(
+            TRACK123_DELETE_URL,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if not resp.ok:
+            print("delete error:", resp.status_code, resp.text)
+            return False
+        return True
+    except Exception as e:
+        print("delete exception:", e)
+        return False
+
+
 def fetch_and_notify_initial_status(track_no: str, chat_id: int) -> bool:
     if not TRACK123_API_KEY:
         return False
 
-    try:
-        headers = {
-            "Track123-Api-Secret": TRACK123_API_KEY,
-            "Content-Type": "application/json",
-            "accept": "application/json",
-        }
-        payload = {"trackNos": [track_no]}
+    headers = {
+        "Track123-Api-Secret": TRACK123_API_KEY,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
 
+    registered = register_tracking(track_no)
+
+    try:
+        payload = {"trackNos": [track_no]}
         resp = requests.post(
             TRACK123_QUERY_URL,
-            json = payload,
-            headers = headers,
-            timeout = 15
+            json=payload,
+            headers=headers,
+            timeout=15,
         )
 
         if not resp.ok:
+            print("track/query error:", resp.status_code, resp.text)
+            if registered:
+                delete_tracking(track_no)
             return False
 
         data = resp.json()
         meta = extract_main_fields(data)
+
+        tn = meta.get("tracking_number")
+        if not tn:
+            print(f"Track {track_no} not found in Track123 response")
+            if registered:
+                delete_tracking(track_no)
+            return False
 
         new_status = meta.get("status_text", "UNKNOWN")
         time_str = meta.get("time_str", "UNKNOWN")
@@ -154,38 +236,41 @@ def fetch_and_notify_initial_status(track_no: str, chat_id: int) -> bool:
                     "time_str": time_str,
                 },
                 "$setOnInsert": {
+                    "track_no": track_no,
                     "created_at": datetime.utcnow(),
                 },
             },
-            upsert = True,
+            upsert=True,
         )
 
-        msg = format_message(track_no, meta, initial = True)
+        msg = format_message(track_no, meta, initial=True)
         send_telegram(chat_id, msg)
 
         return True
 
     except Exception as e:
-        print(e)
-
+        print("initial fetch error:", e)
+        if registered:
+            delete_tracking(track_no)
         return False
+
 
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
 
-    status = html.escape(meta["status_text"])
-    time_str = html.escape(meta["time_str"])
-    origin = meta["origin"]
-    dest = meta["destination"]
+    status = html.escape(meta.get("status_text", "UNKNOWN"))
+    time_str = html.escape(meta.get("time_str", "невідомо"))
+    origin = meta.get("origin", "Unknown")
+    dest = meta.get("destination", "Unknown")
 
-    event = meta["raw_last_event"] or {}
+    event = meta.get("raw_last_event") or {}
     desc = event.get("description") or event.get("eventDetail")
 
     header = "ПОЧАТОК МОНІТОРИНГУ" if initial else "ОНОВЛЕННЯ СТАТУСУ"
 
     msg = [
         f"<b>{theme['header']} {header}</b>",
-        f"📦 <b>Посилка:</b> <code>{track_no}</code>",
+        f"📦 <b>Посилка:</b> <code>{tracking_number}</code>",
         f"{theme['pin']} <b>Статус:</b> {status}",
         "",
         f"{theme['route']} <b>Маршрут:</b> "
@@ -198,6 +283,7 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     msg.append(f"<i>{theme['time']} {time_str}</i>")
 
     return "\n".join(msg)
+
 
 def refresh_all_trackings():
     if not TRACK123_API_KEY:
@@ -213,7 +299,10 @@ def refresh_all_trackings():
             }
             payload = {"trackNos": [t["track_no"]]}
             resp = requests.post(
-                TRACK123_REFRESH_URL, json=payload, headers=headers, timeout=10
+                TRACK123_REFRESH_URL,
+                json=payload,
+                headers=headers,
+                timeout=10,
             )
 
             if not resp.ok:
@@ -223,9 +312,10 @@ def refresh_all_trackings():
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
 
+
 @app.post("/telegram-webhook")
 def telegram_webhook():
-    update = request.get_json(silent = True) or {}
+    update = request.get_json(silent=True) or {}
 
     message = update.get("message") or update.get("edited_message") or {}
     text = (message.get("text") or "").strip()
@@ -245,9 +335,9 @@ def telegram_webhook():
             "Привіт! Я бот для відстеження посилок\n\n"
             "Команди:\n"
             "• <code>/track НОМЕР</code> — почати відслідковувати посилку\n"
-            "• <code>/list</code> — список всіх ваших посилок",
+            "• <code>/list</code> — список всіх ваших посилок\n"
+            "• <code>/untrack НОМЕР</code> — перестати відслідковувати посилку",
         )
-
         return jsonify({"ok": True})
 
     if lower.startswith("/list"):
@@ -259,7 +349,6 @@ def telegram_webhook():
                 "📭 Ви ще не відстежуєте жодної посилки.\n"
                 "Додайте посилку командою:\n<code>/track НОМЕР</code>",
             )
-
             return jsonify({"ok": True})
 
         track_nos = sorted({s["track_no"] for s in subs})
@@ -284,7 +373,37 @@ def telegram_webhook():
             )
 
         send_telegram(chat_id, "\n".join(lines))
+        return jsonify({"ok": True})
 
+    if lower.startswith("/untrack"):
+        parts = text.split(maxsplit=1)
+
+        if len(parts) < 2:
+            send_telegram(
+                chat_id,
+                "❗ Формат: <code>/untrack AEBT0004209245</code>",
+            )
+            return jsonify({"ok": True})
+
+        track_no = parts[1].strip()
+
+        result = subscriptions.delete_one({"chat_id": chat_id, "track_no": track_no})
+
+        if result.deleted_count == 0:
+            send_telegram(
+                chat_id,
+                f"ℹ️ Ви не відстежували посилку <code>{track_no}</code>.",
+            )
+            return jsonify({"ok": True})
+
+        remaining = subscriptions.count_documents({"track_no": track_no})
+        if remaining == 0:
+            trackings.delete_one({"track_no": track_no})
+
+        send_telegram(
+            chat_id,
+            f"🗑 Я перестав відстежувати посилку <code>{track_no}</code> для вас.",
+        )
         return jsonify({"ok": True})
 
     if lower.startswith("/track"):
@@ -305,16 +424,18 @@ def telegram_webhook():
 
         if existing_sub:
             tr = trackings.find_one({"track_no": track_no}) or {}
+            status = tr.get("last_status", "статус ще невідомий")
             last_update = tr.get("last_update")
 
             if isinstance(last_update, datetime):
-                last_str = last_update.strftime("%Y-%m-%d %H:%M:%S")
+                last_str = last_update.strftime("%Y-%m-%d %H:%М:%S")
             else:
                 last_str = "час невідомий"
 
             send_telegram(
                 chat_id,
                 "ℹ️ Ви вже відстежуєте цю посилку.\n"
+                f"Поточний статус: {html.escape(status)} (<i>{last_str}</i>)\n\n"
                 "Подивитися всі посилки: <code>/list</code>",
             )
             return jsonify({"ok": True})
@@ -371,41 +492,10 @@ def telegram_webhook():
             f"🟢 Я відстежую посилку <code>{track_no}</code>.\n"
             f"Подивитися всі посилки: <code>/list</code>",
         )
-
-        return jsonify({"ok": True})
-
-    if lower.startswith("/untrack"):
-        parts = text.split(maxsplit=1)
-
-        if len(parts) < 2:
-            send_telegram(
-                chat_id,
-                "❗ Формат: <code>/untrack AEBT0004209245</code>",
-            )
-            return jsonify({"ok": True})
-
-        track_no = parts[1].strip()
-
-        result = subscriptions.delete_one({"chat_id": chat_id, "track_no": track_no})
-
-        if result.deleted_count == 0:
-            send_telegram(
-                chat_id,
-                f"ℹ️ Ви не відстежували посилку <code>{track_no}</code>.",
-            )
-            return jsonify({"ok": True})
-
-        remaining = subscriptions.count_documents({"track_no": track_no})
-        if remaining == 0:
-            trackings.delete_one({"track_no": track_no})
-
-        send_telegram(
-            chat_id,
-            f"🗑 Я перестав відстежувати посилку <code>{track_no}</code> для вас.",
-        )
         return jsonify({"ok": True})
 
     return jsonify({"ok": True})
+
 
 @app.post("/track123-webhook")
 def track123_webhook():
@@ -450,10 +540,12 @@ def track123_webhook():
 
     return jsonify({"ok": True})
 
+
 @app.get("/")
 def home():
     return "Bot is running!"
 
+
 if __name__ == "__main__":
     refresh_all_trackings()
-    app.run(host="0.0.0.0", port = int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
