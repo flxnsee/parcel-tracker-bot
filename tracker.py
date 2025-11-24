@@ -109,23 +109,21 @@ def parse_iso_to_kyiv(dt_str: str) -> str:
 
 def query_parcels_track(track_no: str):
     """
-    Реалізація згідно з докою:
-    Step 1: POST /api/v3/shipments/tracking (отримуємо uuid +, можливо, кешовані дані)
-    Step 2: GET  /api/v3/shipments/tracking?uuid=...&apiKey=... поки done=true або помилка.
+    Step 1: POST /api/v3/shipments/tracking
+    Step 2: GET  /api/v3/shipments/tracking?uuid=...&apiKey=...
     """
     if not PARCELS_API_KEY:
-        print("❌ No Parcels API key")
+        print("❌ No PARCELS_API_KEY set")
         return None
 
-    # Тіло запиту з доків (trackingId + destinationCountry + language + apiKey)
     payload = {
         "shipments": [
             {
                 "trackingId": str(track_no),
-                "destinationCountry": PARCELS_DESTINATION_COUNTRY,
+                "destinationCountry": "Ukraine",  # можна змінити при бажанні
             }
         ],
-        "language": PARCELS_LANGUAGE,
+        "language": "en",
         "apiKey": PARCELS_API_KEY,
     }
 
@@ -137,24 +135,25 @@ def query_parcels_track(track_no: str):
             timeout=25,
         )
 
-        print("Parcels POST:", track_no, resp.status_code, resp.text[:400])
+        print("Parcels POST:", track_no, resp.status_code, resp.text[:500])
 
         if not resp.ok:
             return None
 
         data = resp.json()
 
+        # якщо явна помилка від API — вважаємо, що трек не знайшли / ключ неправильний
         if data.get("error"):
             print("Parcels error:", data["error"])
             return None
 
-        cached_shipments = data.get("shipments") or []
         uuid = data.get("uuid")
+        shipments = data.get("shipments") or []
         done = data.get("done", False)
 
-        final_shipments = cached_shipments
+        final_shipments = shipments
 
-        # Якщо не done – опитуємо Step 2 кілька разів
+        # якщо ще не done — опитуємо Step 2
         if uuid and not done:
             for i in range(5):
                 time.sleep(2)
@@ -166,30 +165,26 @@ def query_parcels_track(track_no: str):
                     timeout=25,
                 )
 
-                print("Parcels GET:", track_no, status_resp.status_code, status_resp.text[:400])
+                print("Parcels GET:", track_no, status_resp.status_code, status_resp.text[:500])
 
                 if not status_resp.ok:
                     break
 
                 status_data = status_resp.json()
-                # оновлюємо shipments, якщо прийшли
+
                 if status_data.get("shipments"):
                     final_shipments = status_data["shipments"]
 
                 if status_data.get("done", False):
                     break
 
-        if not final_shipments:
-            print("Parcels: empty shipments for", track_no)
-            return None
-
+        # ❗ ТУТ БІЛЬШЕ НЕ ПАДАЄМО, навіть якщо shipments порожній:
         data["shipments"] = final_shipments
         return data
 
     except Exception as e:
         print("Parcels exception:", e)
         return None
-
 
 def extract_main_fields(api_response: dict) -> dict:
     """
@@ -266,7 +261,8 @@ def extract_main_fields(api_response: dict) -> dict:
 def fetch_initial_status(track_no: str, chat_id: int) -> bool:
     """
     Викликається при /track.
-    Якщо Parcels не знаходить посилку — повертає False.
+    Вважаємо успіхом будь-яку валідну відповідь Parcels без поля error.
+    Якщо в shipment’ах поки що немає станів – просто збережемо UNKNOWN.
     """
     data = query_parcels_track(track_no)
 
@@ -275,10 +271,8 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
 
     meta = extract_main_fields(data)
 
+    # Якщо API ще не знає треку – tracking_number може бути None, тоді беремо те, що ввів юзер
     tn = meta.get("tracking_number") or track_no
-    if not tn:
-        print(f"Track {track_no} not found in Parcels response")
-        return False
 
     new_status = meta.get("status_text", "UNKNOWN")
     time_str = meta.get("time_str", "UNKNOWN")
@@ -304,7 +298,6 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
     )
 
     return True
-
 
 # ======================= ФОРМАТУВАННЯ ПОВІДОМЛЕНЬ =======================
 
