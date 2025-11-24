@@ -280,15 +280,22 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
 
 def refresh_all_trackings():
     if not TRACK123_API_KEY:
+        print("❌ No Track123 API key — refresh aborted")
         return
 
     all_tracks = list(trackings.find({}, {"track_no": 1}))
 
     headers = make_track123_headers()
 
+    print(f"🔄 Refresh started for {len(all_tracks)} trackings")
+
     for t in all_tracks:
+        track_no = t["track_no"]
+
         try:
-            payload = {"trackNos": [t["track_no"]]}
+            print(f"➡️ Sending refresh request for {track_no}")
+            payload = {"trackNos": [track_no]}
+
             resp = requests.post(
                 TRACK123_REFRESH_URL,
                 json=payload,
@@ -296,10 +303,15 @@ def refresh_all_trackings():
                 timeout=10,
             )
 
+            print(f"⬅️ Response for {track_no}: {resp.status_code} {resp.text[:100]}")
+
             if not resp.ok:
-                print("Refresh error:", t["track_no"], resp.status_code, resp.text)
+                print("⚠️ Refresh error:", track_no, resp.status_code, resp.text)
+
         except Exception as e:
-            print("Refresh exception:", t["track_no"], e)
+            print("❌ Refresh exception:", track_no, e)
+
+    print("✅ Refresh cycle finished")
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
 
