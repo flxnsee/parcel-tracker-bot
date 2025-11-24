@@ -185,7 +185,7 @@ def delete_tracking(track_no: str) -> bool:
         return False
 
 
-def fetch_and_notify_initial_status(track_no: str, chat_id: int) -> bool:
+def fetch_initial_status(track_no: str, chat_id: int) -> bool:
     if not TRACK123_API_KEY:
         return False
 
@@ -242,9 +242,6 @@ def fetch_and_notify_initial_status(track_no: str, chat_id: int) -> bool:
             },
             upsert=True,
         )
-
-        msg = format_message(track_no, meta, initial=True)
-        send_telegram(chat_id, msg)
 
         return True
 
@@ -334,9 +331,9 @@ def telegram_webhook():
             chat_id,
             "Привіт! Я бот для відстеження посилок\n\n"
             "Команди:\n"
-            "• <code>/track НОМЕР</code> — почати відслідковувати посилку\n"
-            "• <code>/list</code> — список всіх ваших посилок\n"
-            "• <code>/untrack НОМЕР</code> — перестати відслідковувати посилку",
+            "• /track <i>НОМЕР</i> — почати відслідковувати посилку\n"
+            "• /list — список всіх ваших посилок\n"
+            "• /untrack <i>НОМЕР</i> — перестати відслідковувати посилку",
         )
         return jsonify({"ok": True})
 
@@ -347,7 +344,7 @@ def telegram_webhook():
             send_telegram(
                 chat_id,
                 "📭 Ви ще не відстежуєте жодної посилки.\n"
-                "Додайте посилку командою:\n<code>/track НОМЕР</code>",
+                "Додайте посилку командою:\n/track <i>НОМЕР</i>",
             )
             return jsonify({"ok": True})
 
@@ -381,7 +378,7 @@ def telegram_webhook():
         if len(parts) < 2:
             send_telegram(
                 chat_id,
-                "❗ Формат: <code>/untrack AEBT0004209245</code>",
+                "❗ Формат: /untrack <i>ABCD0123456789</i>",
             )
             return jsonify({"ok": True})
 
@@ -392,7 +389,7 @@ def telegram_webhook():
         if result.deleted_count == 0:
             send_telegram(
                 chat_id,
-                f"ℹ️ Ви не відстежували посилку <code>{track_no}</code>.",
+                f"ℹ️ Ви не відстежували посилку <i>>{track_no}</i>.",
             )
             return jsonify({"ok": True})
 
@@ -402,7 +399,7 @@ def telegram_webhook():
 
         send_telegram(
             chat_id,
-            f"🗑 Я перестав відстежувати посилку <code>{track_no}</code> для вас.",
+            f"🗑 Відстежування посилки <i>{track_no}</i> зупинене!",
         )
         return jsonify({"ok": True})
 
@@ -412,7 +409,7 @@ def telegram_webhook():
         if len(parts) < 2:
             send_telegram(
                 chat_id,
-                "❗ Формат: <code>/track AEBT0004209245</code>",
+                "❗ Формат: /track <i>ABCD0123456789</i>",
             )
             return jsonify({"ok": True})
 
@@ -436,17 +433,17 @@ def telegram_webhook():
                 chat_id,
                 "ℹ️ Ви вже відстежуєте цю посилку.\n"
                 f"Поточний статус: {html.escape(status)} (<i>{last_str}</i>)\n\n"
-                "Подивитися всі посилки: <code>/list</code>",
+                "Подивитися всі посилки: <i>/list</i>",
             )
             return jsonify({"ok": True})
 
-        success = fetch_and_notify_initial_status(track_no, chat_id)
+        success = fetch_initial_status(track_no, chat_id)
 
         if not success:
             send_telegram(
                 chat_id,
-                "❌ Не вдалося знайти таку посилку в Track123.\n"
-                "Перевір, чи правильно введений номер.",
+                "❌ Не вдалося знайти таку посилку\n"
+                "Перевір, чи правильно введений номер!",
             )
             return jsonify({"ok": True})
 
@@ -489,8 +486,8 @@ def telegram_webhook():
 
         send_telegram(
             chat_id,
-            f"🟢 Я відстежую посилку <code>{track_no}</code>.\n"
-            f"Подивитися всі посилки: <code>/list</code>",
+            f"🟢 Я відстежую посилку <i>{track_no}</i>.\n"
+            f"Подивитися всі посилки: <i>/list</i>",
         )
         return jsonify({"ok": True})
 
