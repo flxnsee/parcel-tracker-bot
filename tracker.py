@@ -20,12 +20,10 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # Parcels API key: можна використовувати PARCELS_API_KEY,
 # а якщо її немає — візьме значення з TRACK123_API_KEY
-PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY") or os.environ.get("TRACK123_API_KEY")
+PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY")
 
 REFRESH_INTERVAL = 6 * 60 * 60  # 6 годин
 PARCELS_TRACKING_URL = "https://parcelsapp.com/api/v3/shipments/tracking"
-
-TELEGRAM_SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN")
 
 EMOJI_THEMES = [
     {"header": "🔔", "pin": "📍", "route": "✈️", "time": "🕒"},
@@ -491,11 +489,6 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
-    if TELEGRAM_SECRET_TOKEN:
-        incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if incoming_secret != TELEGRAM_SECRET_TOKEN:
-            return jsonify({"ok": False}), 403
-
     update = request.get_json(silent=True) or {}
 
     message = update.get("message") or update.get("edited_message") or {}
