@@ -397,232 +397,221 @@ def refresh_all_trackings():
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
-    update = request.get_json(silent=True) or {}
+    try:
+        update = request.get_json(silent=True) or {}
 
-    message = update.get("message") or update.get("edited_message") or {}
-    text = (message.get("text") or "").strip()
-    chat = message.get("chat") or {}
-    from_user = message.get("from") or {}
+        # Беремо тільки звичайні повідомлення (message / edited_message)
+        message = update.get("message") or update.get("edited_message") or {}
+        text = (message.get("text") or "").strip()
+        chat = message.get("chat") or {}
+        from_user = message.get("from") or {}
 
-    chat_id = chat.get("id")
+        chat_id = chat.get("id")
 
-    if not chat_id or not text:
-        return jsonify({"ok": True})
-
-    lower = text.lower()
-
-    if lower.startswith("/start"):
-        send_telegram(
-            chat_id,
-            "Привіт! Я бот для відстеження посилок 📦\n\n"
-            "Доступні команди:\n"
-            "• <b>/track</b> <i>НОМЕР</i> — почати відстежувати посилку\n"
-            "• <b>/list</b> — список всіх ваших посилок\n"
-            "• <b>/untrack</b> <i>НОМЕР</i> — припинити відстеження\n"
-            "• <b>/info</b> <i>НОМЕР</i> — детальна інформація та історія подій",
-        )
-        return jsonify({"ok": True})
-
-    if lower.startswith("/list"):
-        subs = list(subscriptions.find({"chat_id": chat_id}))
-
-        if not subs:
-            send_telegram(
-                chat_id,
-                "📭 Ви ще не відстежуєте жодної посилки.\n"
-                "Додайте посилку командою:\n<b>/track</b> <i>НОМЕР</i>",
-            )
+        # Якщо немає чату або тексту (стікер, фото, service update) — просто ОК
+        if not chat_id or not text:
             return jsonify({"ok": True})
 
-        track_nos = sorted({s["track_no"] for s in subs if s.get("track_no")})
-        tracks_cursor = trackings.find({"track_no": {"$in": track_nos}})
-        tracks_map = {t["track_no"]: t for t in tracks_cursor}
-
-        lines = ["📦 <b>Ваші посилки:</b>", ""]
-
-        for tn in track_nos:
-            tr = tracks_map.get(tn, {})
-            status = tr.get("last_status", "статус ще невідомий")
-            time_str = tr.get("time_str") or "час невідомий"
-            origin_raw = tr.get("origin", "Unknown")
-            dest_raw = tr.get("destination", "Unknown")
-            origin_code = tr.get("origin_code") or ""
-            dest_code = tr.get("destination_code") or ""
-            origin = esc(origin_raw)
-            dest = esc(dest_raw)
-
-            lines.append(
-                f"• <code>{esc(tn)}</code>\n"
-                f"  🏷 {esc(status)}\n"
-                f"  🌍 {get_flag_emoji(origin_code)} {origin} ➜ "
-                f"{get_flag_emoji(dest_code)} {dest}\n"
-                f"  ⏱ <i>{esc(time_str)}</i>\n"
-            )
-
-        send_telegram(chat_id, "\n".join(lines))
-        return jsonify({"ok": True})
-
-    if lower.startswith("/untrack"):
         parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg_raw = parts[1] if len(parts) > 1 else ""
+        arg = sanitize_tracking_number(arg_raw) if arg_raw else ""
 
-        if len(parts) < 2:
+        # ---------- /start ----------
+        if cmd == "/start":
             send_telegram(
                 chat_id,
-                "❗ Формат: <b>/untrack</b> <i>ABCD0123456789</i>",
+                "Привіт! Я бот для відстеження посилок 📦\n\n"
+                "Доступні команди:\n"
+                "• <b>/track</b> <i>НОМЕР</i> — почати відстежувати посилку\n"
+                "• <b>/list</b> — список всіх ваших посилок\n"
+                "• <b>/untrack</b> <i>НОМЕР</i> — припинити відстеження\n"
+                "• <b>/info</b> <i>НОМЕР</i> — детальна інформація та історія подій",
             )
-            return jsonify({"ok": True})
 
-        track_no = sanitize_tracking_number(parts[1])
-        if not track_no:
-            send_telegram(chat_id, "❗ Некоректний номер відстеження.")
-            return jsonify({"ok": True})
+        # ---------- /list ----------
+        elif cmd == "/list":
+            subs = list(subscriptions.find({"chat_id": chat_id}))
 
-        result = subscriptions.delete_one({"chat_id": chat_id, "track_no": track_no})
+            if not subs:
+                send_telegram(
+                    chat_id,
+                    "📭 Ви ще не відстежуєте жодної посилки.\n"
+                    "Додайте посилку командою:\n<b>/track</b> <i>НОМЕР</i>",
+                )
+            else:
+                track_nos = sorted({s["track_no"] for s in subs if s.get("track_no")})
+                tracks_cursor = trackings.find({"track_no": {"$in": track_nos}})
+                tracks_map = {t["track_no"]: t for t in tracks_cursor}
 
-        if result.deleted_count == 0:
-            send_telegram(
-                chat_id,
-                f"ℹ️ Ви не відстежували посилку <i>{esc(track_no)}</i>.",
-            )
-            return jsonify({"ok": True})
+                lines = ["📦 <b>Ваші посилки:</b>", ""]
 
-        remaining = subscriptions.count_documents({"track_no": track_no})
-        if remaining == 0:
-            trackings.delete_one({"track_no": track_no})
+                for tn in track_nos:
+                    tr = tracks_map.get(tn, {})
+                    status = tr.get("last_status", "статус ще невідомий")
+                    time_str = tr.get("time_str") or "час невідомий"
+                    origin_raw = tr.get("origin", "Unknown")
+                    dest_raw = tr.get("destination", "Unknown")
+                    origin_code = tr.get("origin_code") or ""
+                    dest_code = tr.get("destination_code") or ""
+                    origin = esc(origin_raw)
+                    dest = esc(dest_raw)
 
-        send_telegram(
-            chat_id,
-            f"🗑 Відстежування посилки <i>{esc(track_no)}</i> зупинене!",
-        )
-        return jsonify({"ok": True})
+                    lines.append(
+                        f"• <code>{esc(tn)}</code>\n"
+                        f"  🏷 {esc(status)}\n"
+                        f"  🌍 {get_flag_emoji(origin_code)} {origin} ➜ "
+                        f"{get_flag_emoji(dest_code)} {dest}\n"
+                        f"  ⏱ <i>{esc(time_str)}</i>\n"
+                    )
 
-    if lower.startswith("/track"):
-        parts = text.split(maxsplit=1)
+                send_telegram(chat_id, "\n".join(lines))
 
-        if len(parts) < 2:
-            send_telegram(
-                chat_id,
-                "❗ Формат: <b>/track</b> <i>ABCD0123456789</i>",
-            )
-            return jsonify({"ok": True})
+        # ---------- /untrack ----------
+        elif cmd == "/untrack":
+            if not arg:
+                send_telegram(
+                    chat_id,
+                    "❗ Формат: <b>/untrack</b> <i>ABCD0123456789</i>",
+                )
+            else:
+                track_no = arg
+                result = subscriptions.delete_one({"chat_id": chat_id, "track_no": track_no})
 
-        track_no = sanitize_tracking_number(parts[1])
-        if not track_no:
-            send_telegram(chat_id, "❗ Некоректний номер відстеження.")
-            return jsonify({"ok": True})
+                if result.deleted_count == 0:
+                    send_telegram(
+                        chat_id,
+                        f"ℹ️ Ви не відстежували посилку <i>{esc(track_no)}</i>.",
+                    )
+                else:
+                    remaining = subscriptions.count_documents({"track_no": track_no})
+                    if remaining == 0:
+                        trackings.delete_one({"track_no": track_no})
 
-        existing_sub = subscriptions.find_one(
-            {"chat_id": chat_id, "track_no": track_no}
-        )
+                    send_telegram(
+                        chat_id,
+                        f"🗑 Відстежування посилки <i>{esc(track_no)}</i> зупинене!",
+                    )
 
-        if existing_sub:
-            tr = trackings.find_one({"track_no": track_no}) or {}
-            status = tr.get("last_status", "статус ще невідомий")
-            time_str = tr.get("time_str") or "час невідомий"
+        # ---------- /track ----------
+        elif cmd == "/track":
+            if not arg:
+                send_telegram(
+                    chat_id,
+                    "❗ Формат: <b>/track</b> <i>ABCD0123456789</i>",
+                )
+            else:
+                track_no = arg
 
-            send_telegram(
-                chat_id,
-                "ℹ️ Ви вже відстежуєте цю посилку.\n"
-                f"Поточний статус: {esc(status)} (<i>{esc(time_str)}</i>)\n\n"
-                "Подивитися всі посилки: <b>/list</b>",
-            )
-            return jsonify({"ok": True})
+                existing_sub = subscriptions.find_one(
+                    {"chat_id": chat_id, "track_no": track_no}
+                )
 
-        success = fetch_initial_status(track_no, chat_id)
+                if existing_sub:
+                    tr = trackings.find_one({"track_no": track_no}) or {}
+                    status = tr.get("last_status", "статус ще невідомий")
+                    time_str = tr.get("time_str") or "час невідомий"
 
-        if not success:
-            send_telegram(
-                chat_id,
-                "❌ Не вдалося знайти таку посилку через Parcels.\n"
-                "Перевір, чи правильно введений номер!",
-            )
-            return jsonify({"ok": True})
+                    send_telegram(
+                        chat_id,
+                        "ℹ️ Ви вже відстежуєте цю посилку.\n"
+                        f"Поточний статус: {esc(status)} (<i>{esc(time_str)}</i>)\n\n"
+                        "Подивитися всі посилки: <b>/list</b>",
+                    )
+                else:
+                    success = fetch_initial_status(track_no, chat_id)
 
-        users.update_one(
-            {"chat_id": chat_id},
-            {
-                "$set": {
-                    "chat_id": chat_id,
-                    "username": from_user.get("username"),
-                    "first_name": from_user.get("first_name"),
-                    "updated_at": datetime.utcnow(),
-                },
-                "$setOnInsert": {"created_at": datetime.utcnow()},
-            },
-            upsert=True,
-        )
+                    if not success:
+                        send_telegram(
+                            chat_id,
+                            "❌ Не вдалося знайти таку посилку через Parcels.\n"
+                            "Перевір, чи правильно введений номер!",
+                        )
+                    else:
+                        users.update_one(
+                            {"chat_id": chat_id},
+                            {
+                                "$set": {
+                                    "chat_id": chat_id,
+                                    "username": from_user.get("username"),
+                                    "first_name": from_user.get("first_name"),
+                                    "updated_at": datetime.utcnow(),
+                                },
+                                "$setOnInsert": {"created_at": datetime.utcnow()},
+                            },
+                            upsert=True,
+                        )
 
-        trackings.update_one(
-            {"track_no": track_no},
-            {
-                "$setOnInsert": {
-                    "track_no": track_no,
-                    "created_at": datetime.utcnow(),
-                }
-            },
-            upsert=True,
-        )
+                        trackings.update_one(
+                            {"track_no": track_no},
+                            {
+                                "$setOnInsert": {
+                                    "track_no": track_no,
+                                    "created_at": datetime.utcnow(),
+                                }
+                            },
+                            upsert=True,
+                        )
 
-        subscriptions.update_one(
-            {"chat_id": chat_id, "track_no": track_no},
-            {
-                "$set": {
-                    "chat_id": chat_id,
-                    "track_no": track_no,
-                    "created_at": datetime.utcnow(),
-                }
-            },
-            upsert=True,
-        )
+                        subscriptions.update_one(
+                            {"chat_id": chat_id, "track_no": track_no},
+                            {
+                                "$set": {
+                                    "chat_id": chat_id,
+                                    "track_no": track_no,
+                                    "created_at": datetime.utcnow(),
+                                }
+                            },
+                            upsert=True,
+                        )
 
-        send_telegram(
-            chat_id,
-            f"🟢 Я відстежую посилку <i>{esc(track_no)}</i>.\n"
-            f"Подивитися всі посилки: <b>/list</b>\n"
-            f"Деталі: <b>/info</b> <i>{esc(track_no)}</i>",
-        )
-        return jsonify({"ok": True})
+                        send_telegram(
+                            chat_id,
+                            f"🟢 Я відстежую посилку <i>{esc(track_no)}</i>.\n"
+                            f"Подивитися всі посилки: <b>/list</b>\n"
+                            f"Деталі: <b>/info</b> <i>{esc(track_no)}</i>",
+                        )
 
-    if lower.startswith("/info"):
-        parts = text.split(maxsplit=1)
+        # ---------- /info ----------
+        elif cmd == "/info":
+            if not arg:
+                send_telegram(
+                    chat_id,
+                    "❗ Формат: <b>/info</b> <i>ABCD0123456789</i>",
+                )
+            else:
+                track_no = arg
 
-        if len(parts) < 2:
-            send_telegram(
-                chat_id,
-                "❗ Формат: <b>/info</b> <i>ABCD0123456789</i>",
-            )
-            return jsonify({"ok": True})
+                tr = trackings.find_one({"track_no": track_no})
+                if not tr:
+                    send_telegram(
+                        chat_id,
+                        f"❌ Немає даних про посилку <i>{esc(track_no)}</i>.\n"
+                        "Спробуй додати її командою <b>/track</b>.",
+                    )
+                else:
+                    data = query_parcels_track(track_no)
 
-        track_no = sanitize_tracking_number(parts[1])
-        if not track_no:
-            send_telegram(chat_id, "❗ Некоректний номер відстеження.")
-            return jsonify({"ok": True})
+                    if not data:
+                        send_telegram(chat_id, "⚠️ Не вдалося отримати дані від Parcels")
+                    else:
+                        meta = extract_main_fields(data)
 
-        tr = trackings.find_one({"track_no": track_no})
-        if not tr:
-            send_telegram(
-                chat_id,
-                f"❌ Немає даних про посилку <i>{esc(track_no)}</i>.\n"
-                "Спробуй додати її командою <b>/track</b>.",
-            )
-            return jsonify({"ok": True})
+                        root = data.get("data", data)
+                        shipments = root.get("shipments") or []
+                        shipment = shipments[0] if shipments else {}
+                        history = shipment.get("states") or []
 
-        data = query_parcels_track(track_no)
+                        msg = format_detailed_info(track_no, meta, history)
+                        send_telegram(chat_id, msg)
 
-        if not data:
-            send_telegram(chat_id, "⚠️ Не вдалося отримати дані від Parcels")
-            return jsonify({"ok": True})
+        # інші команди/текст просто ігноруємо
+    except Exception as e:
+        # будь-яка помилка в логах, але відповідь Telegram все одно ОК
+        print("telegram_webhook exception:", repr(e))
 
-        meta = extract_main_fields(data)
-
-        root = data.get("data", data)
-        shipments = root.get("shipments") or []
-        shipment = shipments[0] if shipments else {}
-        history = shipment.get("states") or []
-
-        msg = format_detailed_info(track_no, meta, history)
-        send_telegram(chat_id, msg)
-        return jsonify({"ok": True})
+    # ГАРАНТОВАНИЙ ВІДПОВІДЬ ДЛЯ TELEGRAM
+    return jsonify({"ok": True})
 
 @app.get("/")
 def home():
