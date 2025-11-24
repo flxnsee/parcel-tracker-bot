@@ -39,7 +39,6 @@ def get_flag_emoji(code: str) -> str:
     except Exception:
         return "🌍"
 
-
 def send_telegram(chat_id: int, message: str):
     if not TELEGRAM_TOKEN:
         return
@@ -59,7 +58,6 @@ def send_telegram(chat_id: int, message: str):
     except Exception as e:
         print("Telegram error:", e)
 
-
 def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
     try:
         dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
@@ -71,7 +69,6 @@ def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
         return dt_kyiv.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return dt_str
-
 
 def extract_main_fields(api_response: dict) -> dict:
     root = api_response.get("data", api_response)
@@ -124,7 +121,6 @@ def extract_main_fields(api_response: dict) -> dict:
 
     return result
 
-
 def register_tracking(track_no: str) -> bool:
     if not TRACK123_API_KEY:
         return False
@@ -158,7 +154,6 @@ def register_tracking(track_no: str) -> bool:
         print("import exception:", e)
         return False
 
-
 def delete_tracking(track_no: str) -> bool:
     if not TRACK123_API_KEY:
         return False
@@ -185,7 +180,6 @@ def delete_tracking(track_no: str) -> bool:
     except Exception as e:
         print("delete exception:", e)
         return False
-
 
 def fetch_initial_status(track_no: str, chat_id: int) -> bool:
     if not TRACK123_API_KEY:
@@ -253,7 +247,6 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
             delete_tracking(track_no)
         return False
 
-
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
 
@@ -283,7 +276,6 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
 
     return "\n".join(msg)
 
-
 def refresh_all_trackings():
     if not TRACK123_API_KEY:
         return
@@ -311,6 +303,42 @@ def refresh_all_trackings():
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
 
+def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
+    theme = random.choice(EMOJI_THEMES)
+
+    status = html.escape(meta.get("status_text", "UNKNOWN"))
+    time_str = html.escape(meta.get("time_str", "невідомо"))
+    origin = meta.get("origin", "Unknown")
+    dest = meta.get("destination", "Unknown")
+
+    msg = [
+        f"<b>{theme['header']} Детальна інформація про посилку</b>",
+        f"📦 <b>Номер:</b> <code>{track_no}</code>",
+        f"{theme['pin']} <b>Статус:</b> {status}",
+        f"{theme['route']} <b>Маршрут:</b> "
+        f"{get_flag_emoji(origin)} {origin} ➜ {get_flag_emoji(dest)} {dest}",
+        "",
+        f"<i>{theme['time']} Останнє оновлення: {time_str}</i>",
+        "",
+        "<b>📜 Історія подій:</b>"
+    ]
+
+    if not history:
+        msg.append("Немає даних про історію.")
+        return "\n".join(msg)
+
+    for ev in history:
+        ev_time = ev.get("eventTime", "???")
+        ev_desc = ev.get("description") or ev.get("eventDetail") or "Немає опису"
+        tz = ev.get("timezone", "+08:00")
+        ev_time_kyiv = convert_to_kyiv_time(ev_time, tz)
+
+        msg.append(
+            f"\n• <b>{ev_time_kyiv}</b>\n"
+            f"<blockquote>{html.escape(ev_desc)}</blockquote>"
+        )
+
+    return "\n".join(msg)
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
@@ -493,8 +521,71 @@ def telegram_webhook():
         )
         return jsonify({"ok": True})
 
-    return jsonify({"ok": True})
+    if lower.startswith("/info"):
+        parts = text.split(maxsplit=1)
 
+        if len(parts) < 2:
+            send_telegram(
+                chat_id,
+                "❗ Формат: /info <i>ABCD0123456789</i>"
+            )
+            return jsonify({"ok": True})
+
+        track_no = parts[1].strip()
+
+        tr = trackings.find_one({"track_no": track_no})
+        if not tr:
+            send_telegram(
+                chat_id,
+                f"❌ Немає даних про посилку <i>{track_no}</i>.\n"
+                "Спробуй додати її командою /track"
+            )
+            return jsonify({"ok": True})
+
+        headers = {
+            "Track123-Api-Secret": TRACK123_API_KEY,
+            "Content-Type": "application/json",
+            "accept": "application/json",
+        }
+
+        payload = {"trackNos": [track_no]}
+        try:
+            resp = requests.post(
+                TRACK123_QUERY_URL,
+                json=payload,
+                headers=headers,
+                timeout=10,
+            )
+
+            if not resp.ok:
+                send_telegram(chat_id, "⚠️ Не вдалося отримати дані")
+                return jsonify({"ok": True})
+
+            data = resp.json()
+            meta = extract_main_fields(data)
+
+            root = data.get("data", data)
+            info = root.get("accepted", root)
+            content = info.get("content") or root.get("content") or []
+            tracking = content[0] if content else root
+
+            logistics = tracking.get("localLogisticsInfo", {})
+            history = (
+                    logistics.get("trackingDetails")
+                    or tracking.get("trackingDetails")
+                    or []
+            )
+
+            msg = format_detailed_info(track_no, meta, history)
+            send_telegram(chat_id, msg)
+            return jsonify({"ok": True})
+
+        except Exception as e:
+            print("info command error:", e)
+            send_telegram(chat_id, "⚠️ Помилка при отриманні інформації.")
+            return jsonify({"ok": True})
+
+    return jsonify({"ok": True})
 
 @app.post("/track123-webhook")
 def track123_webhook():
@@ -539,11 +630,9 @@ def track123_webhook():
 
     return jsonify({"ok": True})
 
-
 @app.get("/")
 def home():
     return "Bot is running!"
-
 
 if __name__ == "__main__":
     refresh_all_trackings()
