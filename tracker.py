@@ -3,25 +3,40 @@ import time
 import random
 import html
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import request, jsonify, Flask
 import threading
 from pymongo import MongoClient
 
 app = Flask(__name__)
 
+# --- MongoDB ---
 client = MongoClient(os.environ.get("MONGO_URL"))
 db = client["trackbot"]
 users = db.users
 trackings = db.trackings
 subscriptions = db.subscriptions
 
+# --- Env variables ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY")
+
+# Ключ Parcels API (fallback на старий TRACK123_API_KEY, щоб не міняти одразу env)
+PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY") or os.environ.get("TRACK123_API_KEY")
+
+# Мова відповіді Parcels (en / ru / ... )
 PARCELS_LANGUAGE = os.environ.get("PARCELS_LANGUAGE", "en")
-PARCELS_COUNTRY = os.environ.get("PARCELS_COUNTRY", "Ukraine")
+
+# Країна призначення для запитів (у прикладі в доках — "Canada")
+PARCELS_DESTINATION_COUNTRY = os.environ.get("PARCELS_DESTINATION_COUNTRY", "Ukraine")
+
+# Інтервал рефрешу всіх посилок (6 годин)
 REFRESH_INTERVAL = 6 * 60 * 60
+
+# Базовий URL Parcels
 PARCELS_TRACKING_URL = "https://parcelsapp.com/api/v3/shipments/tracking"
+
+# ТЗ для часу Києва (спрощено, без переходу на літній)
+KYIV_TZ = timezone(timedelta(hours=2))
 
 EMOJI_THEMES = [
     {"header": "🔔", "pin": "📍", "route": "✈️", "time": "🕒"},
@@ -29,16 +44,25 @@ EMOJI_THEMES = [
     {"header": "📣", "pin": "🚩", "route": "🚚", "time": "🕰️"},
 ]
 
+
+# ======================= УТИЛІТИ =======================
+
 def esc(value) -> str:
     return html.escape(str(value), quote=False)
 
+
 def get_flag_emoji(code: str) -> str:
+    """
+    Parcels у відповіді дає originCode/destinationCode типу 'FR', 'CN', 'PL'.
+    Якщо коду немає або він не 2 символи — ставимо 🌍.
+    """
     if not code or len(code) != 2:
         return "🌍"
     try:
         return "".join(chr(127397 + ord(c)) for c in code.upper())
     except Exception:
         return "🌍"
+
 
 def send_telegram(chat_id: int, message: str):
     if not TELEGRAM_TOKEN:
@@ -59,38 +83,61 @@ def send_telegram(chat_id: int, message: str):
     except Exception as e:
         print("Telegram error:", e)
 
-def parse_iso_to_str(dt_str: str) -> str:
+
+def parse_iso_to_kyiv(dt_str: str) -> str:
+    """
+    Parcels повертає дати типу '2024-06-30T12:34:56Z'.
+    Пробуємо перевести в час Києва і віддати 'YYYY-MM-DD HH:MM'.
+    Якщо щось не так — повертаємо рядок як є.
+    """
     if not dt_str:
         return "невідомо"
     try:
-        if dt_str.endswith("Z"):
-            dt_str = dt_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(dt_str)
-        return dt.strftime("%Y-%m-%d %H:%M")
+        s = dt_str.strip()
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_kyiv = dt.astimezone(KYIV_TZ)
+        return dt_kyiv.strftime("%Y-%m-%d %H:%M")
     except Exception:
-        return str(dt_str)
+        return dt_str
+
+
+# ======================= PARCELS API =======================
 
 def query_parcels_track(track_no: str):
+    """
+    Реалізація згідно з докою:
+    Step 1: POST /api/v3/shipments/tracking (отримуємо uuid +, можливо, кешовані дані)
+    Step 2: GET  /api/v3/shipments/tracking?uuid=...&apiKey=... поки done=true або помилка.
+    """
     if not PARCELS_API_KEY:
         print("❌ No Parcels API key")
         return None
 
-    shipments = [
-        {
-            "trackingId": str(track_no),
-            "language": PARCELS_LANGUAGE,
-            "country": PARCELS_COUNTRY,
-        }
-    ]
+    # Тіло запиту з доків (trackingId + destinationCountry + language + apiKey)
+    payload = {
+        "shipments": [
+            {
+                "trackingId": str(track_no),
+                "destinationCountry": PARCELS_DESTINATION_COUNTRY,
+            }
+        ],
+        "language": PARCELS_LANGUAGE,
+        "apiKey": PARCELS_API_KEY,
+    }
 
     try:
         resp = requests.post(
             PARCELS_TRACKING_URL,
-            json={"apiKey": PARCELS_API_KEY, "shipments": shipments},
+            json=payload,
+            headers={"Content-Type": "application/json"},
             timeout=25,
         )
 
-        print("Parcels POST:", resp.status_code, resp.text[:400])
+        print("Parcels POST:", track_no, resp.status_code, resp.text[:400])
 
         if not resp.ok:
             return None
@@ -107,21 +154,27 @@ def query_parcels_track(track_no: str):
 
         final_shipments = cached_shipments
 
+        # Якщо не done – опитуємо Step 2 кілька разів
         if uuid and not done:
             for i in range(5):
                 time.sleep(2)
+
                 status_resp = requests.get(
                     PARCELS_TRACKING_URL,
                     params={"uuid": uuid, "apiKey": PARCELS_API_KEY},
+                    headers={"Accept": "application/json"},
                     timeout=25,
                 )
-                print("Parcels GET:", status_resp.status_code, status_resp.text[:400])
+
+                print("Parcels GET:", track_no, status_resp.status_code, status_resp.text[:400])
 
                 if not status_resp.ok:
                     break
 
                 status_data = status_resp.json()
-                final_shipments = status_data.get("shipments") or final_shipments
+                # оновлюємо shipments, якщо прийшли
+                if status_data.get("shipments"):
+                    final_shipments = status_data["shipments"]
 
                 if status_data.get("done", False):
                     break
@@ -137,60 +190,84 @@ def query_parcels_track(track_no: str):
         print("Parcels exception:", e)
         return None
 
+
 def extract_main_fields(api_response: dict) -> dict:
+    """
+    Приклад відповіді з реальних логів Parcels (урізано):
+
+    {
+      "shipments":[
+        {
+          "states":[
+            {"location":"...", "date":"2024-06-30T10:00:00Z","carrier":0,"status":"En transit."},
+            ...
+          ],
+          "origin":"China",
+          "destination":"France",
+          "destinationCode":"FR",
+          "originCode":"CN",
+          "status":"transit",
+          "trackingId":"XXXXXXXX",
+          "lastState":{"location":"...", "date":"...", "carrier":0, "status":"En transit."}
+        }
+      ],
+      "done":true,
+      "fromCache":true
+    }
+    """
     root = api_response.get("data", api_response)
 
     shipments = root.get("shipments") or []
     shipment = shipments[0] if shipments else {}
 
     states = shipment.get("states") or []
-    last_state = states[-1] if states else {}
+    last_state = shipment.get("lastState") or (states[-1] if states else {})
 
     status_text = (
         last_state.get("status")
-        or last_state.get("description")
         or shipment.get("status")
         or "UNKNOWN"
     )
 
-    time_str_raw = (
-        last_state.get("date")
-        or last_state.get("time")
-        or shipment.get("lastUpdate")
-        or shipment.get("last_updated")
-        or ""
-    )
+    time_raw = last_state.get("date") or ""
 
     origin = (
         shipment.get("origin")
         or shipment.get("originCode")
-        or shipment.get("originCountry")
-        or shipment.get("origin_country")
         or "Unknown"
     )
 
     destination = (
         shipment.get("destination")
         or shipment.get("destinationCode")
-        or shipment.get("destinationCountry")
-        or shipment.get("destination_country")
         or "Unknown"
     )
+
+    origin_code = shipment.get("originCode") or ""
+    dest_code = shipment.get("destinationCode") or ""
 
     tracking_number = shipment.get("trackingId") or shipment.get("tracking_id")
 
     result = {
         "status_text": str(status_text),
-        "time_str": parse_iso_to_str(time_str_raw) if time_str_raw else "невідомо",
+        "time_str": parse_iso_to_kyiv(time_raw) if time_raw else "невідомо",
         "origin": origin,
         "destination": destination,
+        "origin_code": origin_code,
+        "destination_code": dest_code,
         "tracking_number": tracking_number,
-        "raw_last_event": last_state or None,
+        "raw_last_event": last_state or (states[-1] if states else None),
+        "states": states,
     }
 
     return result
 
+
 def fetch_initial_status(track_no: str, chat_id: int) -> bool:
+    """
+    Викликається при /track.
+    Якщо Parcels не знаходить посилку — повертає False.
+    """
     data = query_parcels_track(track_no)
 
     if not data:
@@ -214,6 +291,8 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
                 "last_update": datetime.utcnow(),
                 "origin": meta.get("origin", "UNKNOWN"),
                 "destination": meta.get("destination", "UNKNOWN"),
+                "origin_code": meta.get("origin_code", ""),
+                "destination_code": meta.get("destination_code", ""),
                 "time_str": time_str,
             },
             "$setOnInsert": {
@@ -226,6 +305,9 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
 
     return True
 
+
+# ======================= ФОРМАТУВАННЯ ПОВІДОМЛЕНЬ =======================
+
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
 
@@ -235,13 +317,16 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     origin_raw = meta.get("origin", "Unknown")
     dest_raw = meta.get("destination", "Unknown")
 
+    origin_code = meta.get("origin_code") or ""
+    dest_code = meta.get("destination_code") or ""
+
     origin = esc(origin_raw)
     dest = esc(dest_raw)
 
     event = meta.get("raw_last_event") or {}
     desc = (
-        event.get("description")
-        or event.get("status")
+        event.get("status")
+        or event.get("description")
         or event.get("message")
     )
 
@@ -253,7 +338,7 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
         f"{theme['pin']} <b>Статус:</b> {status}",
         "",
         f"{theme['route']} <b>Маршрут:</b> "
-        f"{get_flag_emoji(origin_raw)} {origin} ➜ {get_flag_emoji(dest_raw)} {dest}",
+        f"{get_flag_emoji(origin_code) } {origin} ➜ {get_flag_emoji(dest_code)} {dest}",
     ]
 
     if desc:
@@ -263,6 +348,7 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
 
     return "\n".join(msg)
 
+
 def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
     theme = random.choice(EMOJI_THEMES)
 
@@ -271,6 +357,9 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
 
     origin_raw = meta.get("origin", "Unknown")
     dest_raw = meta.get("destination", "Unknown")
+    origin_code = meta.get("origin_code") or ""
+    dest_code = meta.get("destination_code") or ""
+
     origin = esc(origin_raw)
     dest = esc(dest_raw)
 
@@ -280,7 +369,7 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
         f"📦 <b>Номер:</b> <code>{esc(track_no)}</code>",
         f"{theme['pin']} <b>Статус:</b> {status}",
         f"{theme['route']} <b>Маршрут:</b> "
-        f"{get_flag_emoji(origin_raw)} {origin} ➜ {get_flag_emoji(dest_raw)} {dest}",
+        f"{get_flag_emoji(origin_code)} {origin} ➜ {get_flag_emoji(dest_code)} {dest}",
         "",
         f"<i>{theme['time']} Останнє оновлення: {time_str}</i>",
         "",
@@ -292,31 +381,31 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
         return "\n".join(msg)
 
     for ev in history:
-        ev_time_raw = (
-            ev.get("date")
-            or ev.get("time")
-            or ev.get("eventTime")
-            or "???"
-        )
+        ev_time_raw = ev.get("date") or ev.get("time") or "???"
+        ev_time = parse_iso_to_kyiv(ev_time_raw)
 
-        ev_time_str = parse_iso_to_str(ev_time_raw)
-
-        ev_desc = (
-            ev.get("description")
-            or ev.get("status")
-            or ev.get("eventDetail")
-            or ev.get("message")
-            or "Немає опису"
-        )
+        status_text = ev.get("status") or ev.get("description") or ev.get("message") or "Немає опису"
+        location = ev.get("location") or ""
+        if location:
+            desc = f"{status_text} ({location})"
+        else:
+            desc = status_text
 
         msg.append(
-            f"\n• <b>{esc(ev_time_str)}</b>\n"
-            f"<blockquote>{esc(ev_desc)}</blockquote>"
+            f"\n• <b>{esc(ev_time)}</b>\n"
+            f"<blockquote>{esc(desc)}</blockquote>"
         )
 
     return "\n".join(msg)
 
+
+# ======================= ПЕРІОДИЧНИЙ REFRESH =======================
+
 def refresh_all_trackings():
+    """
+    Раз на REFRESH_INTERVAL опитуємо Parcels для всіх треків у БД.
+    Якщо статус змінився — оновлюємо Mongo і шлемо нотифікації.
+    """
     if not PARCELS_API_KEY:
         print("❌ No Parcels API key — refresh aborted")
         return
@@ -350,6 +439,8 @@ def refresh_all_trackings():
                         "last_update": datetime.utcnow(),
                         "origin": meta.get("origin", "Unknown"),
                         "destination": meta.get("destination", "Unknown"),
+                        "origin_code": meta.get("origin_code", ""),
+                        "destination_code": meta.get("destination_code", ""),
                         "time_str": time_str,
                     }
                 },
@@ -370,6 +461,9 @@ def refresh_all_trackings():
     print("✅ Parcels refresh cycle finished")
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
+
+
+# ======================= TELEGRAM WEBHOOK =======================
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
@@ -422,13 +516,16 @@ def telegram_webhook():
             time_str = tr.get("time_str") or "час невідомий"
             origin_raw = tr.get("origin", "Unknown")
             dest_raw = tr.get("destination", "Unknown")
+            origin_code = tr.get("origin_code") or ""
+            dest_code = tr.get("destination_code") or ""
             origin = esc(origin_raw)
             dest = esc(dest_raw)
 
             lines.append(
                 f"• <code>{esc(tn)}</code>\n"
                 f"  🏷 {esc(status)}\n"
-                f"  🌍 {get_flag_emoji(origin_raw)} {origin} ➜ {get_flag_emoji(dest_raw)} {dest}\n"
+                f"  🌍 {get_flag_emoji(origin_code)} {origin} ➜ "
+                f"{get_flag_emoji(dest_code)} {dest}\n"
                 f"  ⏱ <i>{esc(time_str)}</i>\n"
             )
 
@@ -590,9 +687,11 @@ def telegram_webhook():
 
     return jsonify({"ok": True})
 
+
 @app.get("/")
 def home():
     return "Bot is running with Parcels API!"
+
 
 if __name__ == "__main__":
     refresh_all_trackings()
