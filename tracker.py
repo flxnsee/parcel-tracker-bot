@@ -138,7 +138,8 @@ def register_tracking(track_no: str) -> bool:
     payload = [
         {
             "trackNo": track_no,
-            "carrier": "Cainiao",
+            "courierCode": "cainiao",
+            "courierNameEN": "Cainiao",
         }
     ]
 
