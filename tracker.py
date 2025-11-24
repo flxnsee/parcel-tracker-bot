@@ -23,7 +23,6 @@ TRACK123_QUERY_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/qu
 TRACK123_IMPORT_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/import"
 TRACK123_DELETE_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/delete"
 TELEGRAM_SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN")
-TRACK123_WEBHOOK_SECRET = os.environ.get("TRACK123_WEBHOOK_SECRET")
 
 EMOJI_THEMES = [
     {"header": "🔔", "pin": "📍", "route": "✈️", "time": "🕒"},
@@ -596,11 +595,6 @@ def telegram_webhook():
 
 @app.post("/track123-webhook")
 def track123_webhook():
-    if TRACK123_WEBHOOK_SECRET:
-        incoming_secret = request.headers.get("X-Track123-Secret")
-        if incoming_secret != TRACK123_WEBHOOK_SECRET:
-            return jsonify({"ok": False}), 403
-
     payload = request.get_json(silent=True) or {}
 
     meta = extract_main_fields(payload)
