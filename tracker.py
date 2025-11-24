@@ -3,7 +3,7 @@ import time
 import random
 import html
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import request, jsonify, Flask
 import threading
 from pymongo import MongoClient
@@ -17,12 +17,10 @@ trackings = db.trackings
 subscriptions = db.subscriptions
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
-# Parcels API key: можна використовувати PARCELS_API_KEY,
-# а якщо її немає — візьме значення з TRACK123_API_KEY
 PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY")
-
-REFRESH_INTERVAL = 6 * 60 * 60  # 6 годин
+PARCELS_LANGUAGE = os.environ.get("PARCELS_LANGUAGE", "en")
+PARCELS_COUNTRY = os.environ.get("PARCELS_COUNTRY", "Ukraine")
+REFRESH_INTERVAL = 6 * 60 * 60
 PARCELS_TRACKING_URL = "https://parcelsapp.com/api/v3/shipments/tracking"
 
 EMOJI_THEMES = [
@@ -31,10 +29,8 @@ EMOJI_THEMES = [
     {"header": "📣", "pin": "🚩", "route": "🚚", "time": "🕰️"},
 ]
 
-
 def esc(value) -> str:
     return html.escape(str(value), quote=False)
-
 
 def get_flag_emoji(code: str) -> str:
     if not code or len(code) != 2:
@@ -43,7 +39,6 @@ def get_flag_emoji(code: str) -> str:
         return "".join(chr(127397 + ord(c)) for c in code.upper())
     except Exception:
         return "🌍"
-
 
 def send_telegram(chat_id: int, message: str):
     if not TELEGRAM_TOKEN:
@@ -64,156 +59,18 @@ def send_telegram(chat_id: int, message: str):
     except Exception as e:
         print("Telegram error:", e)
 
-
-def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
-    """
-    Для старих форматів типу Track123 (ok, якщо не буде використовуватись).
-    Для Parcels, якщо час уже з таймзоною (ISO), просто віддаємо як є.
-    """
+def parse_iso_to_str(dt_str: str) -> str:
     if not dt_str:
         return "невідомо"
     try:
-        # Якщо вже ISO з таймзоною — не чіпаємо
-        if "T" in dt_str and ("+" in dt_str or "Z" in dt_str):
-            return dt_str
-
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        if not tz_str:
-            return dt_str
-
-        sign = 1 if tz_str.startswith("+") else -1
-        hours, minutes = map(int, tz_str[1:].split(":"))
-        offset = timedelta(hours=hours, minutes=minutes) * sign
-        dt_utc = dt - offset
-        dt_kyiv = dt_utc + timedelta(hours=2)
-        return dt_kyiv.strftime("%Y-%m-%d %H:%M:%S")
+        if dt_str.endswith("Z"):
+            dt_str = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(dt_str)
+        return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
-        return dt_str
-
-
-def extract_main_fields(api_response: dict) -> dict:
-    """
-    Уніфікований парсер:
-    - спочатку намагаємося розпарсити Parcels (uuid + shipments)
-    - якщо немає "shipments" — fallback на старий Track123-формат
-    """
-    root = api_response.get("data", api_response)
-
-    # ======= Parcels API структура ======= #
-    if "shipments" in root:
-        shipments = root.get("shipments") or []
-        shipment = shipments[0] if shipments else {}
-
-        result = {
-            "status_text": "UNKNOWN",
-            "time_str": "невідомо",
-            "origin": "Unknown",
-            "destination": "Unknown",
-            "tracking_number": shipment.get("trackingId") or shipment.get("tracking_id"),
-            "raw_last_event": None,
-        }
-
-        # країни відправлення / призначення (якщо API їх віддає)
-        origin = (
-            shipment.get("origin")
-            or shipment.get("originCountryCode")
-        )
-        destination = (
-            shipment.get("destination")
-            or shipment.get("destinationCountryCode")
-        )
-
-        if origin:
-            result["origin"] = origin
-        if destination:
-            result["destination"] = destination
-
-        states = shipment.get("states") or []
-
-        if states:
-            # Як правило, останній елемент — найновіший статус
-            last_state = states[-1]
-            result["raw_last_event"] = last_state
-
-            time_val = (
-                last_state.get("date")
-                or last_state.get("time")
-                or last_state.get("eventTime")
-            )
-            if time_val:
-                # Parcels зазвичай віддає з таймзоною → віддаємо як є
-                result["time_str"] = str(time_val)
-
-            detail = (
-                last_state.get("status")
-                or last_state.get("description")
-                or last_state.get("message")
-                or shipment.get("status")
-                or shipment.get("error")
-            )
-
-            if detail:
-                result["status_text"] = str(detail).split(",")[0]
-        else:
-            detail = shipment.get("status") or shipment.get("error")
-            if detail:
-                result["status_text"] = str(detail).split(",")[0]
-
-        return result
-
-    # ======= Старий Track123 fallback (на всякий випадок) ======= #
-    if "accepted" in root:
-        accepted = root.get("accepted") or {}
-        items = accepted.get("content") or root.get("content") or []
-        tracking = items[0] if items else root
-    else:
-        tracking = root
-
-    result = {
-        "status_text": "UNKNOWN",
-        "time_str": "невідомо",
-        "origin": tracking.get("shipFrom", "Unknown"),
-        "destination": tracking.get("shipTo", "Unknown"),
-        "tracking_number": tracking.get("trackNo") or tracking.get("trackingNumber"),
-        "raw_last_event": None,
-    }
-
-    logistics = tracking.get("localLogisticsInfo", {})
-    details = logistics.get("trackingDetails") or tracking.get("trackingDetails") or []
-
-    last_tracking_time = (
-        tracking.get("lastTrackingTime")
-        or tracking.get("nextUpdateTime")
-        or tracking.get("shipTime")
-    )
-
-    if details:
-        last_event = details[0]
-        result["raw_last_event"] = last_event
-
-        tz = last_event.get("timezone", "+08:00")
-        time_val = last_event.get("eventTime") or last_tracking_time
-        if time_val:
-            result["time_str"] = convert_to_kyiv_time(time_val, tz)
-
-        detail = (
-            last_event.get("eventDetail")
-            or logistics.get("transitSubStatus")
-            or tracking.get("transitSubStatus")
-            or tracking.get("trackingStatus")
-        )
-        if detail:
-            result["status_text"] = str(detail).split(",")[0]
-
-    return result
-
+        return str(dt_str)
 
 def query_parcels_track(track_no: str):
-    """
-    Виклик Parcels API для ОДНІЄЇ посилки.
-    1) POST /shipments/tracking з trackingId
-    2) якщо є uuid і не done — кілька разів опитуємо GET /shipments/tracking
-    """
     if not PARCELS_API_KEY:
         print("❌ No Parcels API key")
         return None
@@ -221,9 +78,8 @@ def query_parcels_track(track_no: str):
     shipments = [
         {
             "trackingId": str(track_no),
-            # опціональні поля, якщо хочеш — можна додати:
-            # "language": "uk",
-            # "country": "Ukraine",
+            "language": PARCELS_LANGUAGE,
+            "country": PARCELS_COUNTRY,
         }
     ]
 
@@ -231,14 +87,19 @@ def query_parcels_track(track_no: str):
         resp = requests.post(
             PARCELS_TRACKING_URL,
             json={"apiKey": PARCELS_API_KEY, "shipments": shipments},
-            timeout=20,
+            timeout=25,
         )
 
+        print("Parcels POST:", resp.status_code, resp.text[:400])
+
         if not resp.ok:
-            print("Parcels POST error:", resp.status_code, resp.text[:200])
             return None
 
         data = resp.json()
+
+        if data.get("error"):
+            print("Parcels error:", data["error"])
+            return None
 
         cached_shipments = data.get("shipments") or []
         uuid = data.get("uuid")
@@ -246,46 +107,90 @@ def query_parcels_track(track_no: str):
 
         final_shipments = cached_shipments
 
-        # Якщо не всі результати одразу — опитуємо GET
         if uuid and not done:
             for i in range(5):
-                try:
-                    time.sleep(2)
-                    status_resp = requests.get(
-                        PARCELS_TRACKING_URL,
-                        params={"uuid": uuid, "apiKey": PARCELS_API_KEY},
-                        timeout=20,
-                    )
-                    if not status_resp.ok:
-                        print(
-                            "Parcels GET error:",
-                            status_resp.status_code,
-                            status_resp.text[:200],
-                        )
-                        break
+                time.sleep(2)
+                status_resp = requests.get(
+                    PARCELS_TRACKING_URL,
+                    params={"uuid": uuid, "apiKey": PARCELS_API_KEY},
+                    timeout=25,
+                )
+                print("Parcels GET:", status_resp.status_code, status_resp.text[:400])
 
-                    status_data = status_resp.json()
-                    final_shipments = status_data.get("shipments") or final_shipments
-
-                    if status_data.get("done", False):
-                        break
-                except Exception as e:
-                    print("Parcels poll exception:", e)
+                if not status_resp.ok:
                     break
 
-        result = data
-        result["shipments"] = final_shipments
-        return result
+                status_data = status_resp.json()
+                final_shipments = status_data.get("shipments") or final_shipments
+
+                if status_data.get("done", False):
+                    break
+
+        if not final_shipments:
+            print("Parcels: empty shipments for", track_no)
+            return None
+
+        data["shipments"] = final_shipments
+        return data
 
     except Exception as e:
         print("Parcels exception:", e)
         return None
 
+def extract_main_fields(api_response: dict) -> dict:
+    root = api_response.get("data", api_response)
+
+    shipments = root.get("shipments") or []
+    shipment = shipments[0] if shipments else {}
+
+    states = shipment.get("states") or []
+    last_state = states[-1] if states else {}
+
+    status_text = (
+        last_state.get("status")
+        or last_state.get("description")
+        or shipment.get("status")
+        or "UNKNOWN"
+    )
+
+    time_str_raw = (
+        last_state.get("date")
+        or last_state.get("time")
+        or shipment.get("lastUpdate")
+        or shipment.get("last_updated")
+        or ""
+    )
+
+    origin = (
+        shipment.get("origin")
+        or shipment.get("originCode")
+        or shipment.get("originCountry")
+        or shipment.get("origin_country")
+        or "Unknown"
+    )
+
+    destination = (
+        shipment.get("destination")
+        or shipment.get("destinationCode")
+        or shipment.get("destinationCountry")
+        or shipment.get("destination_country")
+        or "Unknown"
+    )
+
+    tracking_number = shipment.get("trackingId") or shipment.get("tracking_id")
+
+    result = {
+        "status_text": str(status_text),
+        "time_str": parse_iso_to_str(time_str_raw) if time_str_raw else "невідомо",
+        "origin": origin,
+        "destination": destination,
+        "tracking_number": tracking_number,
+        "raw_last_event": last_state or None,
+    }
+
+    return result
 
 def fetch_initial_status(track_no: str, chat_id: int) -> bool:
-    """
-    Початкове отримання даних по посилці через Parcels.
-    """
     data = query_parcels_track(track_no)
 
     if not data:
@@ -321,7 +226,6 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
 
     return True
 
-
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
 
@@ -337,7 +241,6 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     event = meta.get("raw_last_event") or {}
     desc = (
         event.get("description")
-        or event.get("eventDetail")
         or event.get("status")
         or event.get("message")
     )
@@ -360,12 +263,60 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
 
     return "\n".join(msg)
 
+def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
+    theme = random.choice(EMOJI_THEMES)
+
+    status = esc(meta.get("status_text", "UNKNOWN"))
+    time_str = esc(meta.get("time_str", "невідомо"))
+
+    origin_raw = meta.get("origin", "Unknown")
+    dest_raw = meta.get("destination", "Unknown")
+    origin = esc(origin_raw)
+    dest = esc(dest_raw)
+
+    msg = [
+        f"<b>{theme['header']} Детальна інформація про посилку</b>",
+        "───────────────",
+        f"📦 <b>Номер:</b> <code>{esc(track_no)}</code>",
+        f"{theme['pin']} <b>Статус:</b> {status}",
+        f"{theme['route']} <b>Маршрут:</b> "
+        f"{get_flag_emoji(origin_raw)} {origin} ➜ {get_flag_emoji(dest_raw)} {dest}",
+        "",
+        f"<i>{theme['time']} Останнє оновлення: {time_str}</i>",
+        "",
+        "<b>📜 Історія подій:</b>",
+    ]
+
+    if not history:
+        msg.append("Немає даних про історію.")
+        return "\n".join(msg)
+
+    for ev in history:
+        ev_time_raw = (
+            ev.get("date")
+            or ev.get("time")
+            or ev.get("eventTime")
+            or "???"
+        )
+
+        ev_time_str = parse_iso_to_str(ev_time_raw)
+
+        ev_desc = (
+            ev.get("description")
+            or ev.get("status")
+            or ev.get("eventDetail")
+            or ev.get("message")
+            or "Немає опису"
+        )
+
+        msg.append(
+            f"\n• <b>{esc(ev_time_str)}</b>\n"
+            f"<blockquote>{esc(ev_desc)}</blockquote>"
+        )
+
+    return "\n".join(msg)
 
 def refresh_all_trackings():
-    """
-    Періодичний полінг Parcels API по всім трекам у БД.
-    Якщо статус змінився — оновлюємо в Mongo і шлемо нотифікації.
-    """
     if not PARCELS_API_KEY:
         print("❌ No Parcels API key — refresh aborted")
         return
@@ -388,7 +339,6 @@ def refresh_all_trackings():
             old_track = trackings.find_one({"track_no": track_no})
             old_status = old_track.get("last_status") if old_track else None
 
-            # Якщо статус не змінився — нічого не шлемо
             if old_status == new_status:
                 continue
 
@@ -420,72 +370,6 @@ def refresh_all_trackings():
     print("✅ Parcels refresh cycle finished")
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
-
-
-def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
-    """
-    Детальний вивід:
-    - meta — загальна інформація (статус, маршрут, час)
-    - history — список подій:
-      * для Parcels: shipment["states"]
-      * для Track123: trackingDetails
-    """
-    theme = random.choice(EMOJI_THEMES)
-
-    status = esc(meta.get("status_text", "UNKNOWN"))
-    time_str = esc(meta.get("time_str", "невідомо"))
-
-    origin_raw = meta.get("origin", "Unknown")
-    dest_raw = meta.get("destination", "Unknown")
-    origin = esc(origin_raw)
-    dest = esc(dest_raw)
-
-    msg = [
-        f"<b>{theme['header']} Детальна інформація про посилку</b>",
-        "───────────────",
-        f"📦 <b>Номер:</b> <code>{esc(track_no)}</code>",
-        f"{theme['pin']} <b>Статус:</b> {status}",
-        f"{theme['route']} <b>Маршрут:</b> "
-        f"{get_flag_emoji(origin_raw)} {origin} ➜ {get_flag_emoji(dest_raw)} {dest}",
-        "",
-        f"<i>{theme['time']} Останнє оновлення: {time_str}</i>",
-        "",
-        "<b>📜 Історія подій:</b>",
-    ]
-
-    if not history:
-        msg.append("Немає даних про історію.")
-        return "\n".join(msg)
-
-    for ev in history:
-        ev_time_raw = (
-            ev.get("eventTime")
-            or ev.get("date")
-            or ev.get("time")
-            or "???"
-        )
-
-        tz = ev.get("timezone")
-        if ev.get("eventTime") and tz:
-            ev_time_kyiv = convert_to_kyiv_time(ev_time_raw, tz)
-        else:
-            ev_time_kyiv = str(ev_time_raw)
-
-        ev_desc = (
-            ev.get("description")
-            or ev.get("eventDetail")
-            or ev.get("status")
-            or ev.get("message")
-            or "Немає опису"
-        )
-
-        msg.append(
-            f"\n• <b>{esc(ev_time_kyiv)}</b>\n"
-            f"<blockquote>{esc(ev_desc)}</blockquote>"
-        )
-
-    return "\n".join(msg)
-
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
@@ -616,7 +500,7 @@ def telegram_webhook():
         if not success:
             send_telegram(
                 chat_id,
-                "❌ Не вдалося знайти таку посилку.\n"
+                "❌ Не вдалося знайти таку посилку через Parcels.\n"
                 "Перевір, чи правильно введений номер!",
             )
             return jsonify({"ok": True})
@@ -696,21 +580,9 @@ def telegram_webhook():
         meta = extract_main_fields(data)
 
         root = data.get("data", data)
-
-        if "shipments" in root:
-            shipments = root.get("shipments") or []
-            shipment = shipments[0] if shipments else {}
-            history = shipment.get("states") or []
-        else:
-            info = root.get("accepted", root)
-            content = info.get("content") or root.get("content") or []
-            tracking = content[0] if content else root
-            logistics = tracking.get("localLogisticsInfo", {})
-            history = (
-                logistics.get("trackingDetails")
-                or tracking.get("trackingDetails")
-                or []
-            )
+        shipments = root.get("shipments") or []
+        shipment = shipments[0] if shipments else {}
+        history = shipment.get("states") or []
 
         msg = format_detailed_info(track_no, meta, history)
         send_telegram(chat_id, msg)
@@ -718,11 +590,9 @@ def telegram_webhook():
 
     return jsonify({"ok": True})
 
-
 @app.get("/")
 def home():
     return "Bot is running with Parcels API!"
-
 
 if __name__ == "__main__":
     refresh_all_trackings()
