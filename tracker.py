@@ -1,8 +1,6 @@
 import os
-import json
 import random
 import html
-from pathlib import Path
 import requests
 from datetime import datetime, timedelta
 from flask import request, jsonify, Flask
@@ -290,17 +288,46 @@ def telegram_webhook():
         return jsonify({"ok": True})
 
     if lower.startswith("/track"):
-        parts = text.split(maxsplit = 1)
+        parts = text.split(maxsplit=1)
 
         if len(parts) < 2:
             send_telegram(
                 chat_id,
                 "❗ Формат: <code>/track AEBT0004209245</code>",
             )
-
             return jsonify({"ok": True})
 
         track_no = parts[1].strip()
+
+        existing_sub = subscriptions.find_one(
+            {"chat_id": chat_id, "track_no": track_no}
+        )
+
+        if existing_sub:
+            tr = trackings.find_one({"track_no": track_no}) or {}
+            last_update = tr.get("last_update")
+
+            if isinstance(last_update, datetime):
+                last_str = last_update.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                last_str = "час невідомий"
+
+            send_telegram(
+                chat_id,
+                "ℹ️ Ви вже відстежуєте цю посилку.\n"
+                "Подивитися всі посилки: <code>/list</code>",
+            )
+            return jsonify({"ok": True})
+
+        success = fetch_and_notify_initial_status(track_no, chat_id)
+
+        if not success:
+            send_telegram(
+                chat_id,
+                "❌ Не вдалося знайти таку посилку в Track123.\n"
+                "Перевір, чи правильно введений номер.",
+            )
+            return jsonify({"ok": True})
 
         users.update_one(
             {"chat_id": chat_id},
@@ -313,7 +340,7 @@ def telegram_webhook():
                 },
                 "$setOnInsert": {"created_at": datetime.utcnow()},
             },
-            upsert = True,
+            upsert=True,
         )
 
         trackings.update_one(
@@ -339,14 +366,11 @@ def telegram_webhook():
             upsert=True,
         )
 
-        success = fetch_and_notify_initial_status(track_no, chat_id)
-
-        if not success:
-            send_telegram(
-                chat_id,
-                f"🟢 Я почав слідкувати за посилкою <code>{track_no}</code>.\n"
-                f"Подивитися всі посилки: <code>/list</code>",
-            )
+        send_telegram(
+            chat_id,
+            f"🟢 Я відстежую посилку <code>{track_no}</code>.\n"
+            f"Подивитися всі посилки: <code>/list</code>",
+        )
 
         return jsonify({"ok": True})
 
