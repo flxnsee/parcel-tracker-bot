@@ -1,4 +1,5 @@
 import os
+import time
 import random
 import html
 import requests
@@ -16,12 +17,14 @@ trackings = db.trackings
 subscriptions = db.subscriptions
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TRACK123_API_KEY = os.environ.get("TRACK123_API_KEY")
-REFRESH_INTERVAL = 6 * 60 * 60
-TRACK123_REFRESH_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/refresh-batch"
-TRACK123_QUERY_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/query"
-TRACK123_IMPORT_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/import"
-TRACK123_DELETE_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/delete"
+
+# Parcels API key: можна використовувати PARCELS_API_KEY,
+# а якщо її немає — візьме значення з TRACK123_API_KEY
+PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY") or os.environ.get("TRACK123_API_KEY")
+
+REFRESH_INTERVAL = 6 * 60 * 60  # 6 годин
+PARCELS_TRACKING_URL = "https://parcelsapp.com/api/v3/shipments/tracking"
+
 TELEGRAM_SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN")
 
 EMOJI_THEMES = [
@@ -30,15 +33,10 @@ EMOJI_THEMES = [
     {"header": "📣", "pin": "🚩", "route": "🚚", "time": "🕰️"},
 ]
 
+
 def esc(value) -> str:
     return html.escape(str(value), quote=False)
 
-def make_track123_headers() -> dict:
-    return {
-        "Track123-Api-Secret": TRACK123_API_KEY,
-        "Content-Type": "application/json",
-        "accept": "application/json",
-    }
 
 def get_flag_emoji(code: str) -> str:
     if not code or len(code) != 2:
@@ -47,6 +45,7 @@ def get_flag_emoji(code: str) -> str:
         return "".join(chr(127397 + ord(c)) for c in code.upper())
     except Exception:
         return "🌍"
+
 
 def send_telegram(chat_id: int, message: str):
     if not TELEGRAM_TOKEN:
@@ -67,9 +66,23 @@ def send_telegram(chat_id: int, message: str):
     except Exception as e:
         print("Telegram error:", e)
 
+
 def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
+    """
+    Для старих форматів типу Track123 (ok, якщо не буде використовуватись).
+    Для Parcels, якщо час уже з таймзоною (ISO), просто віддаємо як є.
+    """
+    if not dt_str:
+        return "невідомо"
     try:
+        # Якщо вже ISO з таймзоною — не чіпаємо
+        if "T" in dt_str and ("+" in dt_str or "Z" in dt_str):
+            return dt_str
+
         dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        if not tz_str:
+            return dt_str
+
         sign = 1 if tz_str.startswith("+") else -1
         hours, minutes = map(int, tz_str[1:].split(":"))
         offset = timedelta(hours=hours, minutes=minutes) * sign
@@ -79,9 +92,78 @@ def convert_to_kyiv_time(dt_str: str, tz_str: str) -> str:
     except Exception:
         return dt_str
 
+
 def extract_main_fields(api_response: dict) -> dict:
+    """
+    Уніфікований парсер:
+    - спочатку намагаємося розпарсити Parcels (uuid + shipments)
+    - якщо немає "shipments" — fallback на старий Track123-формат
+    """
     root = api_response.get("data", api_response)
 
+    # ======= Parcels API структура ======= #
+    if "shipments" in root:
+        shipments = root.get("shipments") or []
+        shipment = shipments[0] if shipments else {}
+
+        result = {
+            "status_text": "UNKNOWN",
+            "time_str": "невідомо",
+            "origin": "Unknown",
+            "destination": "Unknown",
+            "tracking_number": shipment.get("trackingId") or shipment.get("tracking_id"),
+            "raw_last_event": None,
+        }
+
+        # країни відправлення / призначення (якщо API їх віддає)
+        origin = (
+            shipment.get("origin")
+            or shipment.get("originCountryCode")
+        )
+        destination = (
+            shipment.get("destination")
+            or shipment.get("destinationCountryCode")
+        )
+
+        if origin:
+            result["origin"] = origin
+        if destination:
+            result["destination"] = destination
+
+        states = shipment.get("states") or []
+
+        if states:
+            # Як правило, останній елемент — найновіший статус
+            last_state = states[-1]
+            result["raw_last_event"] = last_state
+
+            time_val = (
+                last_state.get("date")
+                or last_state.get("time")
+                or last_state.get("eventTime")
+            )
+            if time_val:
+                # Parcels зазвичай віддає з таймзоною → віддаємо як є
+                result["time_str"] = str(time_val)
+
+            detail = (
+                last_state.get("status")
+                or last_state.get("description")
+                or last_state.get("message")
+                or shipment.get("status")
+                or shipment.get("error")
+            )
+
+            if detail:
+                result["status_text"] = str(detail).split(",")[0]
+        else:
+            detail = shipment.get("status") or shipment.get("error")
+            if detail:
+                result["status_text"] = str(detail).split(",")[0]
+
+        return result
+
+    # ======= Старий Track123 fallback (на всякий випадок) ======= #
     if "accepted" in root:
         accepted = root.get("accepted") or {}
         items = accepted.get("content") or root.get("content") or []
@@ -127,98 +209,95 @@ def extract_main_fields(api_response: dict) -> dict:
 
     return result
 
-def register_tracking(track_no: str) -> bool:
-    if not TRACK123_API_KEY:
-        return False
 
-    headers = make_track123_headers()
-    payload = [
+def query_parcels_track(track_no: str):
+    """
+    Виклик Parcels API для ОДНІЄЇ посилки.
+    1) POST /shipments/tracking з trackingId
+    2) якщо є uuid і не done — кілька разів опитуємо GET /shipments/tracking
+    """
+    if not PARCELS_API_KEY:
+        print("❌ No Parcels API key")
+        return None
+
+    shipments = [
         {
-            "trackNo": track_no,
-            "courierCode": "cainiao",
-            "courierNameEN": "Cainiao",
+            "trackingId": str(track_no),
+            # опціональні поля, якщо хочеш — можна додати:
+            # "language": "uk",
+            # "country": "Ukraine",
         }
     ]
 
     try:
         resp = requests.post(
-            TRACK123_IMPORT_URL,
-            json=payload,
-            headers=headers,
-            timeout=15,
+            PARCELS_TRACKING_URL,
+            json={"apiKey": PARCELS_API_KEY, "shipments": shipments},
+            timeout=20,
         )
+
         if not resp.ok:
-            print("import error:", resp.status_code, resp.text)
-            return False
-        return True
-    except Exception as e:
-        print("import exception:", e)
-        return False
-
-def delete_tracking(track_no: str) -> bool:
-    if not TRACK123_API_KEY:
-        return False
-
-    headers = make_track123_headers()
-    payload = {"trackNos": [track_no]}
-
-    try:
-        resp = requests.post(
-            TRACK123_DELETE_URL,
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        if not resp.ok:
-            print("delete error:", resp.status_code, resp.text)
-            return False
-        return True
-    except Exception as e:
-        print("delete exception:", e)
-        return False
-
-def query_track123_track(track_no: str):
-    if not TRACK123_API_KEY:
-        return None
-
-    headers = make_track123_headers()
-    payload = {"trackNos": [track_no]}
-
-    try:
-        resp = requests.post(
-            TRACK123_QUERY_URL,
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        if not resp.ok:
-            print("track/query error:", resp.status_code, resp.text)
+            print("Parcels POST error:", resp.status_code, resp.text[:200])
             return None
 
-        return resp.json()
+        data = resp.json()
+
+        cached_shipments = data.get("shipments") or []
+        uuid = data.get("uuid")
+        done = data.get("done", False)
+
+        final_shipments = cached_shipments
+
+        # Якщо не всі результати одразу — опитуємо GET
+        if uuid and not done:
+            for i in range(5):
+                try:
+                    time.sleep(2)
+                    status_resp = requests.get(
+                        PARCELS_TRACKING_URL,
+                        params={"uuid": uuid, "apiKey": PARCELS_API_KEY},
+                        timeout=20,
+                    )
+                    if not status_resp.ok:
+                        print(
+                            "Parcels GET error:",
+                            status_resp.status_code,
+                            status_resp.text[:200],
+                        )
+                        break
+
+                    status_data = status_resp.json()
+                    final_shipments = status_data.get("shipments") or final_shipments
+
+                    if status_data.get("done", False):
+                        break
+                except Exception as e:
+                    print("Parcels poll exception:", e)
+                    break
+
+        result = data
+        result["shipments"] = final_shipments
+        return result
+
     except Exception as e:
-        print("track/query exception:", e)
+        print("Parcels exception:", e)
         return None
 
-def fetch_initial_status(track_no: str, chat_id: int) -> bool:
-    if not TRACK123_API_KEY:
-        return False
 
-    registered = register_tracking(track_no)
-    data = query_track123_track(track_no)
+def fetch_initial_status(track_no: str, chat_id: int) -> bool:
+    """
+    Початкове отримання даних по посилці через Parcels.
+    """
+    data = query_parcels_track(track_no)
 
     if not data:
-        if registered:
-            delete_tracking(track_no)
         return False
 
     meta = extract_main_fields(data)
 
-    tn = meta.get("tracking_number")
+    tn = meta.get("tracking_number") or track_no
     if not tn:
-        print(f"Track {track_no} not found in Track123 response")
-        if registered:
-            delete_tracking(track_no)
+        print(f"Track {track_no} not found in Parcels response")
         return False
 
     new_status = meta.get("status_text", "UNKNOWN")
@@ -244,6 +323,7 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
 
     return True
 
+
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
 
@@ -257,7 +337,12 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     dest = esc(dest_raw)
 
     event = meta.get("raw_last_event") or {}
-    desc = event.get("description") or event.get("eventDetail")
+    desc = (
+        event.get("description")
+        or event.get("eventDetail")
+        or event.get("status")
+        or event.get("message")
+    )
 
     header = "ПОЧАТОК МОНІТОРИНГУ" if initial else "ОНОВЛЕННЯ СТАТУСУ"
 
@@ -277,51 +362,76 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
 
     return "\n".join(msg)
 
-def refresh_all_trackings():
-    if not TRACK123_API_KEY:
-        print("❌ No Track123 API key — refresh aborted")
 
+def refresh_all_trackings():
+    """
+    Періодичний полінг Parcels API по всім трекам у БД.
+    Якщо статус змінився — оновлюємо в Mongo і шлемо нотифікації.
+    """
+    if not PARCELS_API_KEY:
+        print("❌ No Parcels API key — refresh aborted")
         return
 
     all_tracks = list(trackings.find({}, {"track_no": 1}))
 
-    headers = make_track123_headers()
-
-    print(f"🔄 Refresh started for {len(all_tracks)} trackings")
+    print(f"🔄 Parcels refresh started for {len(all_tracks)} trackings")
 
     for t in all_tracks:
         track_no = t["track_no"]
-
         try:
-            print(f"➡️ Sending refresh request for {track_no}")
+            data = query_parcels_track(track_no)
+            if not data:
+                continue
 
-            payload = [
+            meta = extract_main_fields(data)
+            new_status = meta.get("status_text", "UNKNOWN")
+            time_str = meta.get("time_str", "невідомо")
+
+            old_track = trackings.find_one({"track_no": track_no})
+            old_status = old_track.get("last_status") if old_track else None
+
+            # Якщо статус не змінився — нічого не шлемо
+            if old_status == new_status:
+                continue
+
+            trackings.update_one(
+                {"track_no": track_no},
                 {
-                    "trackNo": track_no,
-                    "courierCode": "cainiao",
-                }
-            ]
-
-            resp = requests.post(
-                TRACK123_REFRESH_URL,
-                json=payload,
-                headers=headers,
-                timeout=10,
+                    "$set": {
+                        "last_status": new_status,
+                        "last_update": datetime.utcnow(),
+                        "origin": meta.get("origin", "Unknown"),
+                        "destination": meta.get("destination", "Unknown"),
+                        "time_str": time_str,
+                    }
+                },
+                upsert=True,
             )
 
-            print(f"⬅️ Response for {track_no}: {resp.status_code} {resp.text[:200]}")
+            subs = list(subscriptions.find({"track_no": track_no}))
+            if not subs:
+                continue
 
-            if not resp.ok:
-                print("⚠️ Refresh error:", track_no, resp.status_code, resp.text)
+            msg = format_message(track_no, meta, initial=(old_status is None))
+            for s in subs:
+                send_telegram(s["chat_id"], msg)
 
         except Exception as e:
-            print("❌ Refresh exception:", track_no, e)
+            print("❌ Parcels refresh exception for", track_no, e)
 
-    print("✅ Refresh cycle finished")
+    print("✅ Parcels refresh cycle finished")
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
 
+
 def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
+    """
+    Детальний вивід:
+    - meta — загальна інформація (статус, маршрут, час)
+    - history — список подій:
+      * для Parcels: shipment["states"]
+      * для Track123: trackingDetails
+    """
     theme = random.choice(EMOJI_THEMES)
 
     status = esc(meta.get("status_text", "UNKNOWN"))
@@ -350,10 +460,26 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
         return "\n".join(msg)
 
     for ev in history:
-        ev_time = ev.get("eventTime", "???")
-        ev_desc = ev.get("description") or ev.get("eventDetail") or "Немає опису"
-        tz = ev.get("timezone", "+08:00")
-        ev_time_kyiv = convert_to_kyiv_time(ev_time, tz)
+        ev_time_raw = (
+            ev.get("eventTime")
+            or ev.get("date")
+            or ev.get("time")
+            or "???"
+        )
+
+        tz = ev.get("timezone")
+        if ev.get("eventTime") and tz:
+            ev_time_kyiv = convert_to_kyiv_time(ev_time_raw, tz)
+        else:
+            ev_time_kyiv = str(ev_time_raw)
+
+        ev_desc = (
+            ev.get("description")
+            or ev.get("eventDetail")
+            or ev.get("status")
+            or ev.get("message")
+            or "Немає опису"
+        )
 
         msg.append(
             f"\n• <b>{esc(ev_time_kyiv)}</b>\n"
@@ -361,6 +487,7 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
         )
 
     return "\n".join(msg)
+
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
@@ -567,25 +694,30 @@ def telegram_webhook():
             )
             return jsonify({"ok": True})
 
-        data = query_track123_track(track_no)
+        data = query_parcels_track(track_no)
 
         if not data:
-            send_telegram(chat_id, "⚠️ Не вдалося отримати дані")
+            send_telegram(chat_id, "⚠️ Не вдалося отримати дані від Parcels")
             return jsonify({"ok": True})
 
         meta = extract_main_fields(data)
 
         root = data.get("data", data)
-        info = root.get("accepted", root)
-        content = info.get("content") or root.get("content") or []
-        tracking = content[0] if content else root
 
-        logistics = tracking.get("localLogisticsInfo", {})
-        history = (
-            logistics.get("trackingDetails")
-            or tracking.get("trackingDetails")
-            or []
-        )
+        if "shipments" in root:
+            shipments = root.get("shipments") or []
+            shipment = shipments[0] if shipments else {}
+            history = shipment.get("states") or []
+        else:
+            info = root.get("accepted", root)
+            content = info.get("content") or root.get("content") or []
+            tracking = content[0] if content else root
+            logistics = tracking.get("localLogisticsInfo", {})
+            history = (
+                logistics.get("trackingDetails")
+                or tracking.get("trackingDetails")
+                or []
+            )
 
         msg = format_detailed_info(track_no, meta, history)
         send_telegram(chat_id, msg)
@@ -593,54 +725,11 @@ def telegram_webhook():
 
     return jsonify({"ok": True})
 
-@app.post("/track123-webhook")
-def track123_webhook():
-    payload = request.get_json(silent=True) or {}
-
-    meta = extract_main_fields(payload)
-    track_no = meta.get("tracking_number")
-
-    if not track_no:
-        return jsonify({"error": "no track"}), 400
-
-    new_status = meta.get("status_text", "UNKNOWN")
-    time_str = meta.get("time_str", "невідомо")
-
-    old_track = trackings.find_one({"track_no": track_no})
-    old_status = old_track.get("last_status") if old_track else None
-
-    if old_status == new_status:
-        return jsonify({"ok": True})
-
-    trackings.update_one(
-        {"track_no": track_no},
-        {
-            "$set": {
-                "last_status": new_status,
-                "last_update": datetime.utcnow(),
-                "origin": meta.get("origin", "Unknown"),
-                "destination": meta.get("destination", "Unknown"),
-                "time_str": time_str,
-            }
-        },
-        upsert=True,
-    )
-
-    subs = list(subscriptions.find({"track_no": track_no}))
-
-    if not subs:
-        return jsonify({"ok": True})
-
-    msg = format_message(track_no, meta, initial=(old_status is None))
-
-    for s in subs:
-        send_telegram(s["chat_id"], msg)
-
-    return jsonify({"ok": True})
 
 @app.get("/")
 def home():
-    return "Bot is running!"
+    return "Bot is running with Parcels API!"
+
 
 if __name__ == "__main__":
     refresh_all_trackings()
