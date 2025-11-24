@@ -160,7 +160,13 @@ def telegram_webhook():
         return jsonify({"ok": True})
 
     if text.startswith("/start"):
-        send_telegram(chat_id, "Привіт! Напиши:\n/track <номер>")
+        send_telegram(
+            chat_id,
+            "Привіт! Я бот для відстеження посилок з Track123.\n\n"
+            "Команди:\n"
+            "• <code>/track НОМЕР</code> — почати відслідковувати посилку\n"
+            "• <code>/list</code> — список всіх ваших посилок",
+        )
 
         return jsonify({"ok": True})
 
