@@ -374,6 +374,37 @@ def telegram_webhook():
 
         return jsonify({"ok": True})
 
+    if lower.startswith("/untrack"):
+        parts = text.split(maxsplit=1)
+
+        if len(parts) < 2:
+            send_telegram(
+                chat_id,
+                "❗ Формат: <code>/untrack AEBT0004209245</code>",
+            )
+            return jsonify({"ok": True})
+
+        track_no = parts[1].strip()
+
+        result = subscriptions.delete_one({"chat_id": chat_id, "track_no": track_no})
+
+        if result.deleted_count == 0:
+            send_telegram(
+                chat_id,
+                f"ℹ️ Ви не відстежували посилку <code>{track_no}</code>.",
+            )
+            return jsonify({"ok": True})
+
+        remaining = subscriptions.count_documents({"track_no": track_no})
+        if remaining == 0:
+            trackings.delete_one({"track_no": track_no})
+
+        send_telegram(
+            chat_id,
+            f"🗑 Я перестав відстежувати посилку <code>{track_no}</code> для вас.",
+        )
+        return jsonify({"ok": True})
+
     return jsonify({"ok": True})
 
 @app.post("/track123-webhook")
