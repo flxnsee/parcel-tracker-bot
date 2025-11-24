@@ -18,7 +18,7 @@ subscriptions = db.subscriptions
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TRACK123_API_KEY = os.environ.get("TRACK123_API_KEY")
 REFRESH_INTERVAL = 6 * 60 * 60
-TRACK123_REFRESH_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/refresh"
+TRACK123_REFRESH_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/refresh-batch"
 TRACK123_QUERY_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/query"
 TRACK123_IMPORT_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/import"
 TRACK123_DELETE_URL = "https://api.track123.com/gateway/open-api/tk/v2.1/track/delete"
@@ -281,6 +281,7 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
 def refresh_all_trackings():
     if not TRACK123_API_KEY:
         print("❌ No Track123 API key — refresh aborted")
+
         return
 
     all_tracks = list(trackings.find({}, {"track_no": 1}))
@@ -294,7 +295,13 @@ def refresh_all_trackings():
 
         try:
             print(f"➡️ Sending refresh request for {track_no}")
-            payload = {"trackNos": [track_no]}
+
+            payload = [
+                {
+                    "trackNo": track_no,
+                    "courierCode": "cainiao",
+                }
+            ]
 
             resp = requests.post(
                 TRACK123_REFRESH_URL,
@@ -303,7 +310,7 @@ def refresh_all_trackings():
                 timeout=10,
             )
 
-            print(f"⬅️ Response for {track_no}: {resp.status_code} {resp.text[:100]}")
+            print(f"⬅️ Response for {track_no}: {resp.status_code} {resp.text[:200]}")
 
             if not resp.ok:
                 print("⚠️ Refresh error:", track_no, resp.status_code, resp.text)
