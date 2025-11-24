@@ -407,7 +407,7 @@ def telegram_webhook():
                 f"• <code>{esc(tn)}</code>\n"
                 f"  🏷 {esc(status)}\n"
                 f"  🌍 {get_flag_emoji(origin_raw)} {origin} ➜ {get_flag_emoji(dest_raw)} {dest}\n"
-                f"  ⏱ <i>{esc(time_str)}</i>"
+                f"  ⏱ <i>{esc(time_str)}</i>\n"
             )
 
         send_telegram(chat_id, "\n".join(lines))
