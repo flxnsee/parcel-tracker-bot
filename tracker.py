@@ -10,33 +10,20 @@ from pymongo import MongoClient
 
 app = Flask(__name__)
 
-# --- MongoDB ---
 client = MongoClient(os.environ.get("MONGO_URL"))
 db = client["trackbot"]
 users = db.users
 trackings = db.trackings
 subscriptions = db.subscriptions
 
-# --- Env variables ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
-# Ключ Parcels API (fallback на старий TRACK123_API_KEY, щоб не міняти одразу env)
-PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY") or os.environ.get("TRACK123_API_KEY")
-
-# Мова відповіді Parcels (en / ru / ... )
+PARCELS_API_KEY = os.environ.get("PARCELS_API_KEY")
 PARCELS_LANGUAGE = os.environ.get("PARCELS_LANGUAGE", "en")
-
-# Країна призначення для запитів (у прикладі в доках — "Canada")
 PARCELS_DESTINATION_COUNTRY = os.environ.get("PARCELS_DESTINATION_COUNTRY", "Ukraine")
-
-# Інтервал рефрешу всіх посилок (6 годин)
-REFRESH_INTERVAL = 6 * 60 * 60
-
-# Базовий URL Parcels
+REFRESH_INTERVAL = 10 * 60
 PARCELS_TRACKING_URL = "https://parcelsapp.com/api/v3/shipments/tracking"
-
-# ТЗ для часу Києва (спрощено, без переходу на літній)
 KYIV_TZ = timezone(timedelta(hours=2))
+MAX_TRACK_NO_LENGTH = 64
 
 EMOJI_THEMES = [
     {"header": "🔔", "pin": "📍", "route": "✈️", "time": "🕒"},
@@ -44,18 +31,22 @@ EMOJI_THEMES = [
     {"header": "📣", "pin": "🚩", "route": "🚚", "time": "🕰️"},
 ]
 
-
-# ======================= УТИЛІТИ =======================
+session = requests.Session()
 
 def esc(value) -> str:
     return html.escape(str(value), quote=False)
 
+def sanitize_tracking_number(raw: str) -> str:
+    if not raw:
+        return ""
+    raw = raw.strip()
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
+    cleaned = "".join(ch for ch in raw if ch in allowed)
+    if not cleaned:
+        return ""
+    return cleaned[:MAX_TRACK_NO_LENGTH]
 
 def get_flag_emoji(code: str) -> str:
-    """
-    Parcels у відповіді дає originCode/destinationCode типу 'FR', 'CN', 'PL'.
-    Якщо коду немає або він не 2 символи — ставимо 🌍.
-    """
     if not code or len(code) != 2:
         return "🌍"
     try:
@@ -63,14 +54,14 @@ def get_flag_emoji(code: str) -> str:
     except Exception:
         return "🌍"
 
-
 def send_telegram(chat_id: int, message: str):
     if not TELEGRAM_TOKEN:
+        print("⚠️ TELEGRAM_TOKEN is not set, cannot send message")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(
+        session.post(
             url,
             data={
                 "chat_id": chat_id,
@@ -83,13 +74,7 @@ def send_telegram(chat_id: int, message: str):
     except Exception as e:
         print("Telegram error:", e)
 
-
 def parse_iso_to_kyiv(dt_str: str) -> str:
-    """
-    Parcels повертає дати типу '2024-06-30T12:34:56Z'.
-    Пробуємо перевести в час Києва і віддати 'YYYY-MM-DD HH:MM'.
-    Якщо щось не так — повертаємо рядок як є.
-    """
     if not dt_str:
         return "невідомо"
     try:
@@ -104,14 +89,7 @@ def parse_iso_to_kyiv(dt_str: str) -> str:
     except Exception:
         return dt_str
 
-
-# ======================= PARCELS API =======================
-
 def query_parcels_track(track_no: str):
-    """
-    Step 1: POST /api/v3/shipments/tracking
-    Step 2: GET  /api/v3/shipments/tracking?uuid=...&apiKey=...
-    """
     if not PARCELS_API_KEY:
         print("❌ No PARCELS_API_KEY set")
         return None
@@ -120,29 +98,28 @@ def query_parcels_track(track_no: str):
         "shipments": [
             {
                 "trackingId": str(track_no),
-                "destinationCountry": "Ukraine",  # можна змінити при бажанні
+                "destinationCountry": PARCELS_DESTINATION_COUNTRY,
             }
         ],
-        "language": "en",
+        "language": PARCELS_LANGUAGE,
         "apiKey": PARCELS_API_KEY,
     }
 
     try:
-        resp = requests.post(
+        resp = session.post(
             PARCELS_TRACKING_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=25,
         )
 
-        print("Parcels POST:", track_no, resp.status_code, resp.text[:500])
+        print("Parcels POST:", track_no, resp.status_code, resp.text[:300])
 
         if not resp.ok:
             return None
 
         data = resp.json()
 
-        # якщо явна помилка від API — вважаємо, що трек не знайшли / ключ неправильний
         if data.get("error"):
             print("Parcels error:", data["error"])
             return None
@@ -153,19 +130,18 @@ def query_parcels_track(track_no: str):
 
         final_shipments = shipments
 
-        # якщо ще не done — опитуємо Step 2
         if uuid and not done:
-            for i in range(5):
+            for _ in range(3):
                 time.sleep(2)
 
-                status_resp = requests.get(
+                status_resp = session.get(
                     PARCELS_TRACKING_URL,
                     params={"uuid": uuid, "apiKey": PARCELS_API_KEY},
                     headers={"Accept": "application/json"},
                     timeout=25,
                 )
 
-                print("Parcels GET:", track_no, status_resp.status_code, status_resp.text[:500])
+                print("Parcels GET:", track_no, status_resp.status_code, status_resp.text[:300])
 
                 if not status_resp.ok:
                     break
@@ -178,7 +154,6 @@ def query_parcels_track(track_no: str):
                 if status_data.get("done", False):
                     break
 
-        # ❗ ТУТ БІЛЬШЕ НЕ ПАДАЄМО, навіть якщо shipments порожній:
         data["shipments"] = final_shipments
         return data
 
@@ -187,29 +162,6 @@ def query_parcels_track(track_no: str):
         return None
 
 def extract_main_fields(api_response: dict) -> dict:
-    """
-    Приклад відповіді з реальних логів Parcels (урізано):
-
-    {
-      "shipments":[
-        {
-          "states":[
-            {"location":"...", "date":"2024-06-30T10:00:00Z","carrier":0,"status":"En transit."},
-            ...
-          ],
-          "origin":"China",
-          "destination":"France",
-          "destinationCode":"FR",
-          "originCode":"CN",
-          "status":"transit",
-          "trackingId":"XXXXXXXX",
-          "lastState":{"location":"...", "date":"...", "carrier":0, "status":"En transit."}
-        }
-      ],
-      "done":true,
-      "fromCache":true
-    }
-    """
     root = api_response.get("data", api_response)
 
     shipments = root.get("shipments") or []
@@ -257,22 +209,13 @@ def extract_main_fields(api_response: dict) -> dict:
 
     return result
 
-
 def fetch_initial_status(track_no: str, chat_id: int) -> bool:
-    """
-    Викликається при /track.
-    Вважаємо успіхом будь-яку валідну відповідь Parcels без поля error.
-    Якщо в shipment’ах поки що немає станів – просто збережемо UNKNOWN.
-    """
     data = query_parcels_track(track_no)
 
     if not data:
         return False
 
     meta = extract_main_fields(data)
-
-    # Якщо API ще не знає треку – tracking_number може бути None, тоді беремо те, що ввів юзер
-    tn = meta.get("tracking_number") or track_no
 
     new_status = meta.get("status_text", "UNKNOWN")
     time_str = meta.get("time_str", "UNKNOWN")
@@ -298,8 +241,6 @@ def fetch_initial_status(track_no: str, chat_id: int) -> bool:
     )
 
     return True
-
-# ======================= ФОРМАТУВАННЯ ПОВІДОМЛЕНЬ =======================
 
 def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     theme = random.choice(EMOJI_THEMES)
@@ -331,7 +272,7 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
         f"{theme['pin']} <b>Статус:</b> {status}",
         "",
         f"{theme['route']} <b>Маршрут:</b> "
-        f"{get_flag_emoji(origin_code) } {origin} ➜ {get_flag_emoji(dest_code)} {dest}",
+        f"{get_flag_emoji(origin_code)} {origin} ➜ {get_flag_emoji(dest_code)} {dest}",
     ]
 
     if desc:
@@ -340,7 +281,6 @@ def format_message(tracking_number: str, meta: dict, *, initial: bool) -> str:
     msg.append(f"<i>{theme['time']} {time_str}</i>")
 
     return "\n".join(msg)
-
 
 def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
     theme = random.choice(EMOJI_THEMES)
@@ -377,7 +317,12 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
         ev_time_raw = ev.get("date") or ev.get("time") or "???"
         ev_time = parse_iso_to_kyiv(ev_time_raw)
 
-        status_text = ev.get("status") or ev.get("description") or ev.get("message") or "Немає опису"
+        status_text = (
+            ev.get("status")
+            or ev.get("description")
+            or ev.get("message")
+            or "Немає опису"
+        )
         location = ev.get("location") or ""
         if location:
             desc = f"{status_text} ({location})"
@@ -391,72 +336,64 @@ def format_detailed_info(track_no: str, meta: dict, history: list) -> str:
 
     return "\n".join(msg)
 
-
-# ======================= ПЕРІОДИЧНИЙ REFRESH =======================
-
 def refresh_all_trackings():
-    """
-    Раз на REFRESH_INTERVAL опитуємо Parcels для всіх треків у БД.
-    Якщо статус змінився — оновлюємо Mongo і шлемо нотифікації.
-    """
     if not PARCELS_API_KEY:
-        print("❌ No Parcels API key — refresh aborted")
+        print("❌ No PARCELS_API_KEY set — refresh aborted")
         return
 
     all_tracks = list(trackings.find({}, {"track_no": 1}))
 
-    print(f"🔄 Parcels refresh started for {len(all_tracks)} trackings")
+    print(f"🔄 Parcels auto-refresh started, {len(all_tracks)} trackings")
 
     for t in all_tracks:
-        track_no = t["track_no"]
-        try:
-            data = query_parcels_track(track_no)
-            if not data:
-                continue
+        track_no = t.get("track_no")
+        if not track_no:
+            continue
 
-            meta = extract_main_fields(data)
-            new_status = meta.get("status_text", "UNKNOWN")
-            time_str = meta.get("time_str", "невідомо")
+        print(f"➡️ Перевіряю {track_no}")
 
-            old_track = trackings.find_one({"track_no": track_no})
-            old_status = old_track.get("last_status") if old_track else None
+        data = query_parcels_track(track_no)
+        if not data:
+            print(f"⚠️ Parcels не повернув даних для {track_no}")
+            continue
 
-            if old_status == new_status:
-                continue
+        meta = extract_main_fields(data)
+        new_status = meta.get("status_text", "UNKNOWN")
+        time_str = meta.get("time_str", "невідомо")
 
-            trackings.update_one(
-                {"track_no": track_no},
-                {
-                    "$set": {
-                        "last_status": new_status,
-                        "last_update": datetime.utcnow(),
-                        "origin": meta.get("origin", "Unknown"),
-                        "destination": meta.get("destination", "Unknown"),
-                        "origin_code": meta.get("origin_code", ""),
-                        "destination_code": meta.get("destination_code", ""),
-                        "time_str": time_str,
-                    }
-                },
-                upsert=True,
-            )
+        old = trackings.find_one({"track_no": track_no})
+        old_status = old.get("last_status") if old else None
 
-            subs = list(subscriptions.find({"track_no": track_no}))
-            if not subs:
-                continue
+        if old_status == new_status:
+            continue
 
-            msg = format_message(track_no, meta, initial=(old_status is None))
-            for s in subs:
-                send_telegram(s["chat_id"], msg)
+        print(f"🟢 Оновлення статусу {track_no}: {old_status} → {new_status}")
 
-        except Exception as e:
-            print("❌ Parcels refresh exception for", track_no, e)
+        trackings.update_one(
+            {"track_no": track_no},
+            {
+                "$set": {
+                    "last_status": new_status,
+                    "last_update": datetime.utcnow(),
+                    "origin": meta.get("origin", "Unknown"),
+                    "destination": meta.get("destination", "Unknown"),
+                    "origin_code": meta.get("origin_code", ""),
+                    "destination_code": meta.get("destination_code", ""),
+                    "time_str": time_str,
+                }
+            },
+            upsert=True,
+        )
 
-    print("✅ Parcels refresh cycle finished")
+        subs = list(subscriptions.find({"track_no": track_no}))
+        if not subs:
+            continue
+
+        msg = format_message(track_no, meta, initial=False)
+        for s in subs:
+            send_telegram(s["chat_id"], msg)
 
     threading.Timer(REFRESH_INTERVAL, refresh_all_trackings).start()
-
-
-# ======================= TELEGRAM WEBHOOK =======================
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
@@ -497,7 +434,7 @@ def telegram_webhook():
             )
             return jsonify({"ok": True})
 
-        track_nos = sorted({s["track_no"] for s in subs})
+        track_nos = sorted({s["track_no"] for s in subs if s.get("track_no")})
         tracks_cursor = trackings.find({"track_no": {"$in": track_nos}})
         tracks_map = {t["track_no"]: t for t in tracks_cursor}
 
@@ -535,7 +472,10 @@ def telegram_webhook():
             )
             return jsonify({"ok": True})
 
-        track_no = parts[1].strip()
+        track_no = sanitize_tracking_number(parts[1])
+        if not track_no:
+            send_telegram(chat_id, "❗ Некоректний номер відстеження.")
+            return jsonify({"ok": True})
 
         result = subscriptions.delete_one({"chat_id": chat_id, "track_no": track_no})
 
@@ -566,7 +506,10 @@ def telegram_webhook():
             )
             return jsonify({"ok": True})
 
-        track_no = parts[1].strip()
+        track_no = sanitize_tracking_number(parts[1])
+        if not track_no:
+            send_telegram(chat_id, "❗ Некоректний номер відстеження.")
+            return jsonify({"ok": True})
 
         existing_sub = subscriptions.find_one(
             {"chat_id": chat_id, "track_no": track_no}
@@ -650,7 +593,10 @@ def telegram_webhook():
             )
             return jsonify({"ok": True})
 
-        track_no = parts[1].strip()
+        track_no = sanitize_tracking_number(parts[1])
+        if not track_no:
+            send_telegram(chat_id, "❗ Некоректний номер відстеження.")
+            return jsonify({"ok": True})
 
         tr = trackings.find_one({"track_no": track_no})
         if not tr:
@@ -678,13 +624,9 @@ def telegram_webhook():
         send_telegram(chat_id, msg)
         return jsonify({"ok": True})
 
-    return jsonify({"ok": True})
-
-
 @app.get("/")
 def home():
     return "Bot is running with Parcels API!"
-
 
 if __name__ == "__main__":
     refresh_all_trackings()
