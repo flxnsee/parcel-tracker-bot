@@ -361,6 +361,10 @@ def refresh_all_trackings():
         new_status = meta.get("status_text", "UNKNOWN")
         time_str = meta.get("time_str", "невідомо")
 
+        if new_status == "UNKNOWN":
+            print(f"⚠️ Status became UNKNOWN for {track_no}, skipping update")
+            continue
+
         old = trackings.find_one({"track_no": track_no})
         old_status = old.get("last_status") if old else None
 
@@ -400,7 +404,6 @@ def telegram_webhook():
     try:
         update = request.get_json(silent=True) or {}
 
-        # Беремо тільки звичайні повідомлення (message / edited_message)
         message = update.get("message") or update.get("edited_message") or {}
         text = (message.get("text") or "").strip()
         chat = message.get("chat") or {}
@@ -408,7 +411,6 @@ def telegram_webhook():
 
         chat_id = chat.get("id")
 
-        # Якщо немає чату або тексту (стікер, фото, service update) — просто ОК
         if not chat_id or not text:
             return jsonify({"ok": True})
 
@@ -417,7 +419,6 @@ def telegram_webhook():
         arg_raw = parts[1] if len(parts) > 1 else ""
         arg = sanitize_tracking_number(arg_raw) if arg_raw else ""
 
-        # ---------- /start ----------
         if cmd == "/start":
             send_telegram(
                 chat_id,
@@ -429,7 +430,6 @@ def telegram_webhook():
                 "• <b>/info</b> <i>НОМЕР</i> — детальна інформація та історія подій",
             )
 
-        # ---------- /list ----------
         elif cmd == "/list":
             subs = list(subscriptions.find({"chat_id": chat_id}))
 
@@ -467,7 +467,6 @@ def telegram_webhook():
 
                 send_telegram(chat_id, "\n".join(lines))
 
-        # ---------- /untrack ----------
         elif cmd == "/untrack":
             if not arg:
                 send_telegram(
@@ -493,7 +492,6 @@ def telegram_webhook():
                         f"🗑 Відстежування посилки <i>{esc(track_no)}</i> зупинене!",
                     )
 
-        # ---------- /track ----------
         elif cmd == "/track":
             if not arg:
                 send_telegram(
@@ -572,7 +570,6 @@ def telegram_webhook():
                             f"Деталі: <b>/info</b> <i>{esc(track_no)}</i>",
                         )
 
-        # ---------- /info ----------
         elif cmd == "/info":
             if not arg:
                 send_telegram(
@@ -605,17 +602,14 @@ def telegram_webhook():
                         msg = format_detailed_info(track_no, meta, history)
                         send_telegram(chat_id, msg)
 
-        # інші команди/текст просто ігноруємо
     except Exception as e:
-        # будь-яка помилка в логах, але відповідь Telegram все одно ОК
         print("telegram_webhook exception:", repr(e))
 
-    # ГАРАНТОВАНИЙ ВІДПОВІДЬ ДЛЯ TELEGRAM
     return jsonify({"ok": True})
 
 @app.get("/")
 def home():
-    return "Bot is running with Parcels API!"
+    return "Bot is running!"
 
 if __name__ == "__main__":
     refresh_all_trackings()
