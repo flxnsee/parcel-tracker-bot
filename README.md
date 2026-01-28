@@ -61,7 +61,7 @@ The bot supports multiple tracked parcels per user, keeps delivery history, and 
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-username/parcel-tracking-bot.git
+   git clone https://github.com/flxnsee/parcel-tracking-bot.git
    cd parcel-tracking-bot
    ```
 
